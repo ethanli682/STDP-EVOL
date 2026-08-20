@@ -1,0 +1,135 @@
+Bootstrap: docker
+From: ubuntu:20.04
+
+%labels
+    Author HebbianMetaLearning container
+    Version 1.5
+
+%environment
+    export DEBIAN_FRONTEND=noninteractive
+    export PATH=/opt/conda/bin:$PATH
+    export PYTHONPATH=/opt/HebbianMetaLearning:$PYTHONPATH
+    export LD_LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:/usr/lib/i386-linux-gnu:$LD_LIBRARY_PATH
+    export PYOPENGL_PLATFORM=osmesa
+
+%post
+    set -e
+    export DEBIAN_FRONTEND=noninteractive
+
+    apt-get update && apt-get install -y --no-install-recommends \
+        git \
+        wget \
+        curl \
+        build-essential \
+        cmake \
+        pkg-config \
+        swig \
+        xvfb \
+        libgl1 \
+        libgl1-mesa-glx \
+        libgl1-mesa-dev \
+        libgl1-mesa-dri \
+        libglu1-mesa \
+        libglu1-mesa-dev \
+        libegl1-mesa \
+        libegl1-mesa-dev \
+        libgles2-mesa \
+        libosmesa6 \
+        libosmesa6-dev \
+        libglfw3 \
+        libglfw3-dev \
+        freeglut3-dev \
+        mesa-utils \
+        x11-utils \
+        python3-opengl \
+        libxrandr2 \
+        libxrender1 \
+        libxi6 \
+        libxinerama1 \
+        libxcursor1 \
+        libxxf86vm1 \
+        libglib2.0-0 \
+        libsm6 \
+        libxext6 \
+        zlib1g-dev \
+        libjpeg-dev \
+        libpng-dev \
+        python3 \
+        python3-pip \
+        python3-venv \
+        python3-dev \
+        ffmpeg \
+        llvm-11 \
+        llvm-11-dev \
+        && apt-get clean \
+        && rm -rf /var/lib/apt/lists/*
+
+    ln -sf /usr/lib/x86_64-linux-gnu/libGL.so.1 /usr/local/lib/libGL.so.1
+    ln -sf /usr/lib/x86_64-linux-gnu/libGL.so.1 /usr/local/lib/libGL.so
+    ldconfig
+
+    ln -sf /usr/bin/llvm-config-11 /usr/bin/llvm-config
+
+    python3 -m venv /opt/conda
+    export PATH=/opt/conda/bin:$PATH
+
+    /opt/conda/bin/python -m pip install --upgrade \
+        "pip==23.2.1" \
+        "setuptools==65.5.0" \
+        "wheel==0.38.4"
+
+    /opt/conda/bin/python -m pip install --no-cache-dir \
+        "numpy>=1.18.4,<1.24" \
+        "numba>=0.56,<0.59" \
+        "matplotlib>=3.2.1" \
+        "Box2D>=2.3.10" \
+        "atari-py>=0.2.6" \
+        "scikit-learn" \
+        "pyyaml" \
+        "psutil" \
+        "zstandard" \
+        "gym==0.21.0" \
+        "pyglet==1.5.27" \
+        "PyOpenGL==3.1.6" \
+        "PyOpenGL-accelerate==3.1.6" \
+        "pybullet==2.6.6" \
+        "torch==2.4.1" \
+        "torchvision==0.19.1" \
+        "opencv-python-headless==4.10.0.84"
+
+    git clone https://github.com/enajx/HebbianMetaLearning /opt/HebbianMetaLearning
+
+    /opt/conda/bin/python - <<'PY'
+import cv2
+print('cv2:', cv2.__version__)
+print('cv2_path:', cv2.__file__)
+print('qt_enabled:', 'QT' in cv2.getBuildInformation())
+PY
+
+    echo "export PATH=/opt/conda/bin:\$PATH" >> /etc/bash.bashrc
+
+%runscript
+    export PATH=/opt/conda/bin:$PATH
+    cd /opt/HebbianMetaLearning
+    exec "$@"
+
+%help
+    Container for HebbianMetaLearning (NeurIPS 2020).
+    Repo: https://github.com/enajx/HebbianMetaLearning
+
+    Build:
+        singularity build hebb.sif HebbianMetaLearning/hebb.def
+
+    Run on headless cluster:
+        singularity exec hebb.sif xvfb-run -a -s "-screen 0 1400x900x24 +extension RANDR" \
+            python train_hebb.py --environment CarRacing-v0
+
+    If xvfb-run still fails to propagate DISPLAY to workers, pass it explicitly:
+        DISPLAY=:99 singularity exec --env DISPLAY=:99 hebb.sif \
+            xvfb-run -a -s "-screen 0 1400x900x24 +extension RANDR" \
+            python train_hebb.py --environment CarRacing-v0
+
+    GPU:
+        singularity exec --nv hebb.sif xvfb-run -a -s "-screen 0 1400x900x24 +extension RANDR" \
+            python train_hebb.py --environment CarRacing-v0
+        Swap torch/torchvision for CUDA wheels from https://download.pytorch.org/whl/torch_stable.html

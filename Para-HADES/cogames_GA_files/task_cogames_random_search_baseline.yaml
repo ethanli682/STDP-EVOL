@@ -1,0 +1,28 @@
+main:
+  StaticEval:
+    # Same env config as task_cogames_static.yaml so the baseline is directly
+    # comparable to a CMA-ES run at matched wallclock.
+    mission: arena
+    num_agents: 4
+    fitness_stat: composite_v5_role_event
+    eval_episodes: 40
+    seed_base: 12345
+    render: False
+    hidden: [64, 32]
+    obs_mode: legacy_flat
+    frame_stack: 5
+    grid_h: 11
+    grid_w: 11
+    num_channels: 3
+    global_state_dim: 70
+    fitness_v5:
+      w_F_heart:        5.0
+      w_F_chest:        5.0
+      w_F_ep:           3.0
+      w_B_ach_ore:      0.3
+      w_B_ach_gear:     0.5
+      w_B_role_events:  0.2
+      w_B_explore:      0.4
+      w_B_init:         0.0
+      score_B_cap:      3.0
+      reduction:        max

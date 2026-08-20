@@ -1,0 +1,274 @@
+param:
+  # -----------------------------------------------------------------------
+  # Hebbian LoRA parameterization:
+  #   For each family f ∈ {A, B, C, D, lr} and each FC layer l:
+  #       W_f,l = beta_f * W0_f,l + U_f,l @ V_f,l
+  #
+  #   - W0 is frozen, deterministic random (generated from main.HebLoRA.w0_seed)
+  #   - sigma(W0) = 1/sqrt(d_in)
+  #   - beta_f is evolved scalar (shared across all layers/synapses of family f)
+  #   - LoRA rank defaults to 8 and is read from main.HebLoRA.rank
+  #
+  # Network: input(900) → 128 → 64 → 5 actions  (no CNN)
+  # obs_shape=(300,3), mission=tutorial.scout
+  # Layer shapes (rank=8):
+  #   l1: (900,128)  U:(900,8)=7200  V:(8,128)=1024
+  #   l2: (128,64)   U:(128,8)=1024  V:(8,64)=512
+  #   l3: (64,5)     U:(64,8)=512    V:(8,5)=40
+  # -----------------------------------------------------------------------
+
+  # Each beta scalar lives in its own coevo group. The previous setup lumped
+  # all 5 betas into a single "_default" group, which caused catastrophic
+  # CMA-ES condition numbers (100K-700K) because beta_lr is in [-1,1] while
+  # beta_A..D are in [-10,10] — mixing wildly different scales in one
+  # covariance matrix. Per-group isolation gives each scalar its own 1-D
+  # CMA-ES state and avoids the conditioning blowup.
+  beta_A:
+    type: float
+    array: [1]
+    name: beta_A
+    round: 5
+    min: -10.0
+    max: 10.0
+    default:
+    coevo_group: beta_A
+
+  beta_B:
+    type: float
+    array: [1]
+    name: beta_B
+    round: 5
+    min: -10.0
+    max: 10.0
+    default:
+    coevo_group: beta_B
+
+  beta_C:
+    type: float
+    array: [1]
+    name: beta_C
+    round: 5
+    min: -10.0
+    max: 10.0
+    default:
+    coevo_group: beta_C
+
+  beta_D:
+    type: float
+    array: [1]
+    name: beta_D
+    round: 5
+    min: -10.0
+    max: 10.0
+    default:
+    coevo_group: beta_D
+
+  beta_lr:
+    type: float
+    array: [1]
+    name: beta_lr
+    round: 5
+    min: -1.0
+    max: 1.0
+    default:
+    coevo_group: beta_lr
+
+  # -------- Layer shapes --------
+  # l1: (900,128), l2: (128,64), l3: (64,5), rank=8
+  # U dims: (d_in, rank)  -> flattened
+  # V dims: (rank, d_out) -> flattened
+
+  A_l1_u: {type: float, array: [7200], name: A_l1_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: A_l1}
+  A_l1_v: {type: float, array: [1024], name: A_l1_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: A_l1}
+  A_l2_u: {type: float, array: [1024], name: A_l2_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: A_l2}
+  A_l2_v: {type: float, array: [512],  name: A_l2_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: A_l2}
+  A_l3_u: {type: float, array: [512],  name: A_l3_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: A_l3}
+  A_l3_v: {type: float, array: [40],   name: A_l3_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: A_l3}
+
+  B_l1_u: {type: float, array: [7200], name: B_l1_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: B_l1}
+  B_l1_v: {type: float, array: [1024], name: B_l1_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: B_l1}
+  B_l2_u: {type: float, array: [1024], name: B_l2_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: B_l2}
+  B_l2_v: {type: float, array: [512],  name: B_l2_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: B_l2}
+  B_l3_u: {type: float, array: [512],  name: B_l3_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: B_l3}
+  B_l3_v: {type: float, array: [40],   name: B_l3_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: B_l3}
+
+  C_l1_u: {type: float, array: [7200], name: C_l1_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: C_l1}
+  C_l1_v: {type: float, array: [1024], name: C_l1_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: C_l1}
+  C_l2_u: {type: float, array: [1024], name: C_l2_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: C_l2}
+  C_l2_v: {type: float, array: [512],  name: C_l2_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: C_l2}
+  C_l3_u: {type: float, array: [512],  name: C_l3_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: C_l3}
+  C_l3_v: {type: float, array: [40],   name: C_l3_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: C_l3}
+
+  D_l1_u: {type: float, array: [7200], name: D_l1_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: D_l1}
+  D_l1_v: {type: float, array: [1024], name: D_l1_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: D_l1}
+  D_l2_u: {type: float, array: [1024], name: D_l2_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: D_l2}
+  D_l2_v: {type: float, array: [512],  name: D_l2_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: D_l2}
+  D_l3_u: {type: float, array: [512],  name: D_l3_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: D_l3}
+  D_l3_v: {type: float, array: [40],   name: D_l3_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: D_l3}
+
+  lr_l1_u: {type: float, array: [7200], name: lr_l1_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: lr_l1}
+  lr_l1_v: {type: float, array: [1024], name: lr_l1_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: lr_l1}
+  lr_l2_u: {type: float, array: [1024], name: lr_l2_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: lr_l2}
+  lr_l2_v: {type: float, array: [512],  name: lr_l2_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: lr_l2}
+  lr_l3_u: {type: float, array: [512],  name: lr_l3_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: lr_l3}
+  lr_l3_v: {type: float, array: [40],   name: lr_l3_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: lr_l3}
+
+main:
+  HebLoRA:
+    rank: 8
+    w0_seed: 12345
+
+  HebEval:
+    # CUTOVER 2026-05-08: unified onto arena + composite_v5_role_event so all
+    # 7 task variants are comparable.
+    mission: arena
+    num_agents: 4                       # spawn_count on map_builder is synced in evaluate
+    fitness_stat: composite_v5_role_event
+    eval_episodes: 40
+    seed_base: 12345
+    render: False
+    fitness_v5:
+      w_F_heart:        5.0
+      w_F_chest:        5.0
+      w_F_ep:           3.0
+      w_B_ach_ore:      0.3
+      w_B_ach_gear:     0.5
+      w_B_role_events:  0.2
+      w_B_explore:      0.4
+      # w_B_init=0 under reduction='max' (see task_cogames_static.yaml).
+      w_B_init:         0.0
+      score_B_cap:      3.0
+      reduction:        max
+
+  Task_resource:
+    type: CPU
+    gpu: 0
+    cpu: 2
+    memory: '32GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Task'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/mettagrid.sif'
+
+
+  Main_resource:
+    type: CPU
+    gpu: 0
+    cpu: 10
+    memory: '128GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Agent'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'
+
+
+ML:
+    RevFF_predictor:
+        top_k_percentile: 20
+        dropout_rate: 0.2
+        epochs: 300
+        batch_size: 16
+        learning_rate: 0.001
+        early_stop_threshold: 0.05
+
+        min_epochs_before_early_stop: 10
+        allowed_architectures: ['ANN']
+        max_models_to_train: 1
+        validation: False
+        validation_split: 0.2
+        buffer_multiplier: 2
+        use_log_scaler: False
+
+    CMA_ES:
+        scaler_type: rank
+        use_smoothing: True
+        diag_mode: auto
+        diag_mode_threshold: 4096
+        max_full_cov_gib: 32.0
+
+
+    GA:
+        mutation_rate: 0.1
+        sigma: 0.1
+        crossover_prob: 0.5
+        scaler_type: rank
+
+    SNES:
+        scaler_type: rank
+        lr_mu: 1.0
+        lr_sigma: 1.0
+
+    DiffusionEvo:
+        # ========== ALGORITHM SELECTION ==========
+        algorithm: conditional    # Options: "conditional" or "unconditional"
+
+        # ========== SHARED PARAMETERS (both algorithms) ==========
+        use_log_scaler: True      # Use log scaler for fitness (vs rank scaler)
+        top_k_percentile: 20      # Top % of genes to load for learning
+
+        # ========== UNCONDITIONAL PARAMETERS (algorithm=unconditional) ==========
+        num_steps: 100
+        noise_scale: 0.5
+        latent_dim: auto
+        alpha_schedule: cosine
+        pool_size: auto
+        min_datapoints: None
+
+        # ========== CONDITIONAL PARAMETERS (algorithm=conditional) ==========
+        hidden_dims: None
+        diffusion_steps: 100
+        learning_rate: 0.001
+        weight_decay: 0.00001
+        batch_size: 32
+        max_epochs: 777
+        conditions: [fitness]
+        custom_conditions: {}
+        exploration_mode: adaptive
+        exploration_noise: 0.1
+        mutation_rate: 0.1
+        use_model_cache: True
+        force_retrain: False
+        validation_split: 0.1
+
+        # ========== FINE-TUNING CONTROLS ==========
+        use_finetuning: True
+        finetune_lr_scale: 0.5
+        finetune_epoch_scale: 0.5
+        finetune_min_epochs: 150
+        finetune_every_n_gens: 1
+        finetune_decay: 0.95
+        checkpoint_dir: running
+
+    HADES:
+        hidden_dims: 512
+        diffusion_steps: 1000
+        learning_rate: 0.00001
+        weight_decay: 0.0001
+        batch_size: 64
+        max_epochs: 10
+        layers: 6
+        dropout: 0.1
+        inference_steps: 50
+        guidance_scale: 4.0
+        fitness_embedding_scale: 1.0
+        top_k_percentile: 20
+
+        use_finetuning: True
+        finetune_lr_scale: 0.5
+        finetune_epoch_scale: 0.5
+        finetune_min_epochs: 10
+        finetune_every_n_gens: 1
+        finetune_decay: 0.95
+        checkpoint_dir: running
+
+founder:
+  # When saveFounder() saves a new best gene, it will also call the function
+  # below to reconstruct the full Hebbian parameter payload and write
+  # a companion .pt file.
+    full_params_fn:
+        module: task_cogames_hebb_LoRA
+        function: reconstruct_full_hebb_params

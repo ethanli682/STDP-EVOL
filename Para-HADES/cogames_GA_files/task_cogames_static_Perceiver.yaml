@@ -1,0 +1,333 @@
+param:
+  # -----------------------------------------------------------------------
+  # Static Perceiver-lite cross-attention controller, no bias, no plasticity.
+  #
+  # Per-step tokens = 4 frame_stack tokens of dim 433 (stacked_grid encoding:
+  # 11*11*3 spatial + 70 global). A bank of 8 persistent latents (dim 32) is
+  # carried across steps within an episode; each step the latents cross-attend
+  # to the frame tokens and are refreshed via a residual tanh update. The
+  # mean-pooled latents drive a linear head over 5 actions.
+  #
+  # Defaults: d_model=32, num_latents=8, per_frame_dim=64 (encoder), action_dim=5.
+  # 2026-05-22: switched to a frozen random_proj encoder (encoder_dim=64) so
+  # each raw 433-dim frame is collapsed before becoming a Perceiver token.
+  # W_proj therefore shrinks 13,856 -> 2,048.
+  #
+  # W_proj : 32 *  64 =  2,048   (token -> d_model projection)
+  # W_q    : 32 *  32 =  1,024   (latent -> query)
+  # W_k    : 32 *  32 =  1,024   (token' -> key)
+  # W_v    : 32 *  32 =  1,024   (token' -> value)
+  # W_o    : 32 *  32 =  1,024   (attended value -> latent residual)
+  # L_init :  8 *  32 =    256   (initial latent bank, reset each episode)
+  # W_out  :  5 *  32 =    160   (output head)
+  # TOTAL            =  6,560 evolved params  (was 18,368)
+  # -----------------------------------------------------------------------
+  W_proj:
+    type: float
+    array: [2048]    # d_model * encoder_dim
+    name: W_proj
+    round: 4
+    min: -3.0
+    max:  3.0
+    default:
+    coevo_group: W_proj
+
+  W_q:
+    type: float
+    array: [1024]
+    name: W_q
+    round: 4
+    min: -3.0
+    max:  3.0
+    default:
+    coevo_group: W_q
+
+  W_k:
+    type: float
+    array: [1024]
+    name: W_k
+    round: 4
+    min: -3.0
+    max:  3.0
+    default:
+    coevo_group: W_k
+
+  W_v:
+    type: float
+    array: [1024]
+    name: W_v
+    round: 4
+    min: -3.0
+    max:  3.0
+    default:
+    coevo_group: W_v
+
+  W_o:
+    type: float
+    array: [1024]
+    name: W_o
+    round: 4
+    min: -3.0
+    max:  3.0
+    default:
+    coevo_group: W_o
+
+  L_init:
+    type: float
+    array: [256]
+    name: L_init
+    round: 4
+    min: -3.0
+    max:  3.0
+    default:
+    coevo_group: L_init
+
+  W_out:
+    type: float
+    array: [160]
+    name: W_out
+    round: 4
+    min: -3.0
+    max:  3.0
+    default:
+    coevo_group: W_out
+
+main:
+  StaticEval:
+    # 2026-06-12: tutorial.scout -> tutorial.miner. tutorial.scout's reward variant
+    # REWARDS scout gear and PENALISES miner gear (-1.0) -- wrong warmup for a miner
+    # curriculum. tutorial.miner rewards the miner gear (right Stage-0 warmup). The
+    # granted token is `miner` (the stale `decoder` was an old-src artifact). Both
+    # missions contain the full extractor/hub/junction loop; only the reward differs.
+    mission: tutorial.miner
+    # 2026-05-01: bumped to 4 agents per episode; genome scored by best agent.
+    num_agents: 4
+    # CUTOVER 2026-05-08: composite_v5_role_event replaces v4_role_gated.
+    # CUTOVER 2026-05-18: composite_v7_zstat -- miner-gated mine-and-deposit
+    # fitness (composite_v7.py). Trains agents to pick the miner role.
+    fitness_stat: composite_v8_zstat
+    eval_episodes: 40
+    max_steps: 2000        # v8 long-horizon: the full mine -> deposit ->
+                           # craft heart -> pick capturer role -> align
+                           # junction loop does not fit in 1000 steps (was
+                           # the mission default). 2x longer episodes.
+
+    seed_base: 12345
+    render: False
+    d_model: 32
+    num_latents: 8
+    fitness_v5:
+      w_F_heart:        5.0
+      w_F_chest:        5.0
+      w_F_ep:           3.0
+      w_B_ach_ore:      0.3
+      w_B_ach_gear:     0.5
+      w_B_role_events:  0.2
+      w_B_explore:      0.4
+      # w_B_init=0 under reduction='max' (see task_cogames_static.yaml).
+      w_B_init:         0.0
+      score_B_cap:      3.0
+      reduction:        max
+    # v7 = composite_v7_zstat. Activate by setting fitness_stat above.
+    # See task_cogames_static.yaml for the v7 description and the 2026-05-28
+    # rebalance rationale.
+    fitness_v7:
+      # 2026-06-12 Phase-0 recalibration (see project_jun11_diagnosis). The (6,6)
+      # obs fix made miner_fraction real, which RE-ARMED a degenerate "grab miner
+      # token + freeze" optimum: gru WON jun11 (score 4.0) by HOLDING the role 72%
+      # of the time while mining the least (5.4 units, 0 deposits) -- score_role
+      # paid it 2.15 = 7.7x its whole haul. Fix: role is a KEY that unlocks the
+      # gate, not a prize; the haul loop (carry ramp + deposit beacon) now dominates.
+      w_role:           0.5   # was 3.0 — stop paying to merely HOLD the role; effective_gate still gives holders up to ~6.7x on mining
+      w_wrong:          2.0   # penalty for holding scout/aligner/scrambler
+      w_touch:          0.5   # was 1.0 — small one-time discovery rung, don't keep paying for it
+      w_explore:        2.0   # ungated cold-start rung (now capped lower, see explore_cap)
+      explore_cap:      0.4   # was 0.8 (hardcoded) — wandering can no longer substitute for real work
+      w_approach:       0.5   # ungated continuous gradient toward the c:miner station
+      w_carry:          1.5   # 2026-06-24 was 4.0 — carry is "best load ever, never reset" so it banks the moment cargo fills; at 4.0 it dominated and "load-up-then-stop" was locally optimal (jun22 gru/att). Cut so the COMPLETED haul, not the partial load, is the prize
+      w_mine:           8.0   # 2026-06-24 was 15.0 — same reason: mine_progress credits the in-progress load peak, so it overpaid incomplete hauls. Lowered so deposit dominates
+      w_deposit:       30.0   # a completed haul must dominate; with deposit_pow the first deposit is a ~10pt beacon
+      deposit_pow:      0.5   # sqrt curve: first completed haul jumps deposit_progress 0.2->0.447, dwarfing the free bootstrap ceiling
+      w_hold:           0.5   # 2026-06-24 was 0.0 — reinstated: holding a full cargo now bleeds score each step, the missing pull back to the hub. The dump pays it back many times over, so completing the loop nets strongly positive
+      w_idle:           1.0   # ungated penalty for an agent that neither mines nor explores
+      gate_floor:       0.15  # partial gate: non-miners still earn 15% of mining reward → continuous gradient (0.0 = old hard gate)
+      gate_carry:       1.0   # 2026-06-17 route the carry ramp through effective_gate: kills the role-free carry plateau that made fitness indifferent between hold-role-XOR-mine (jun14)
+      target_roundtrips: 3    # 2026-06-17 was 5 — founders completed ~0.7 of ONE haul, so the deposit beacon was unreachable; lower target makes the first completed haul a reachable, large beacon
+      high_fill_frac:   0.45  # 2026-06-24 NEW (was hardcoded 0.8) — jun22 founders peaked at fill ~0.55 of cap and NEVER cleared 0.8, so completed_cycles ~= 0 and the deposit/haul terms gave NO gradient (the root cause: the goal behaviour was invisible). 0.45 makes genuine miner-level loads register a round-trip while small non-miner loads (~0.40) still do not
+      low_fill_frac:    0.2   # 2026-06-24 NEW (was hardcoded 0.2) — dump threshold unchanged; the dump still requires travelling to a chest, so in-place oscillation farming stays defeated
+      reduction:        mean  # restore bottom2_mean once a competent miner reliably emerges (the coordination rung)
+
+    # =====================================================================
+    # v8 = composite_v8_zstat. STAGED multi-role curriculum (2026-07-01).
+    # Rewards ALL roles except scout, unlocked in order so the GA climbs a
+    # ladder instead of facing a flat multi-objective surface:
+    #   Stage A (early)         reward the MINER role -> gates mine/haul/deposit.
+    #   Stage B (post-deposit)  a completed deposit UNLOCKS the aligner/
+    #                           scrambler role reward AND decays the miner-role
+    #                           reward ("reward the miner role less").
+    #   Stage C (post-capturer) holding aligner/scrambler UNLOCKS the big prize:
+    #                           getting hearts + capturing territory (align/
+    #                           scramble junctions) -- the true objective.
+    # Scout is the ONLY penalised role. See composite_v8.py for the full model.
+    # Activate by setting `fitness_stat: composite_v8_zstat` above (already set).
+    fitness_v8:
+      # -- ungated bootstrap (keeps the surface non-flat; scout is the only penalty)
+      w_explore:        2.0
+      explore_cap:      0.4
+      w_touch:          0.5
+      w_approach:       0.5
+      w_idle:           1.0
+      w_scout:          2.0    # penalty for holding the scout role (the only penalty)
+      # -- stage A: miner role + gated mine/haul/deposit
+      w_role_miner:     0.5    # miner is a KEY that unlocks the gate, not a prize
+      w_miner_decay:    0.5    # miner-role reward shrinks up to 50% as deposits rise
+      w_mine:           8.0
+      w_deposit:       20.0
+      deposit_pow:      0.5    # sqrt: the first completed haul is a big beacon
+      w_hold:           0.5
+      w_carry:          1.5
+      gate_carry:       1.0
+      gate_floor:       0.15   # stage-A soft gate floor (0 = hard miner gate)
+      high_fill_frac:   0.45
+      low_fill_frac:    0.2
+      target_roundtrips: 3
+      # -- stage B: aligner/scrambler role, unlocked by depositing
+      w_role2:          3.0
+      role2_target:     0.30   # capturer-role holding fraction counted as full commit
+      b_floor:          0.10   # stage-B soft gate floor on deposit_progress
+      # -- stage C: hearts + territory, unlocked by holding a capturer role
+      w_heart:          4.0
+      heart_target:     3.0
+      w_territory:     30.0    # THE prize: capture/contest territory with hearts
+      territory_target: 3.0
+      w_align_share:    1.0    # aligning (neutral->team) is the true capture
+      w_scramble_share: 0.5    # scrambling (contest enemy) counts, weighted less
+      c_floor:          0.10   # stage-C soft gate floor on capturer commitment
+      reduction:        mean   # restore bottom2_mean once full-loop agents emerge
+    # Frame-stacked dense-grid observation (shared with evaluate_static_GRU_cogames.py)
+    # 2026-05-22: dropped from 5 to 2 (see project-arch-comparison notes).
+    frame_stack: 2
+    grid_h: 11
+    grid_w: 11
+    num_channels: 3
+    global_state_dim: 70
+    # Frozen pre-projection of each raw frame (2026-05-22). encoder_seed must
+    # match across all four architecture YAMLs.
+    obs_encoder:  random_proj
+    encoder_dim:  64
+    encoder_seed: 1337
+
+  Task_resource:
+    type: CPU
+    gpu: 0
+    cpu: 2
+    memory: '32GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Task'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/mettagrid.sif'
+
+  Main_resource:
+    type: CPU
+    gpu: 0
+    cpu: 10
+    memory: '128GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Agent'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'
+
+
+ML:
+    RevFF_predictor:
+        use_log_scaler: False
+        top_k_percentile: 20
+        dropout_rate: 0.2
+        epochs: 300
+        batch_size: 16
+        learning_rate: 0.001
+        early_stop_threshold: 0.05
+        min_epochs_before_early_stop: 10
+        allowed_architectures: ['ANN']
+        max_models_to_train: 1
+        validation: False
+        validation_split: 0.2
+        buffer_multiplier: 2
+
+    CMA_ES:
+        scaler_type: rank
+        use_smoothing: True
+        diag_mode: auto
+        diag_mode_threshold: 4096
+        max_full_cov_gib: 32.0
+        sigma_boost_factor: 1.0
+        sigma_max_restart: 1.5
+        initial_sigma: 0.1
+
+    GA:
+        mutation_rate: 0.1
+        sigma: 0.3
+        crossover_prob: 0.5
+        scaler_type: rank
+
+    SNES:
+        scaler_type: rank
+        lr_mu: 1.0
+        lr_sigma: 1.0
+
+    DiffusionEvo:
+        algorithm: conditional
+        use_log_scaler: True
+        top_k_percentile: 20
+        num_steps: 100
+        noise_scale: 0.5
+        latent_dim: auto
+        alpha_schedule: cosine
+        pool_size: auto
+        min_datapoints: None
+        hidden_dims: None
+        diffusion_steps: 100
+        learning_rate: 0.001
+        weight_decay: 0.00001
+        batch_size: 32
+        max_epochs: 777
+        conditions: [fitness]
+        custom_conditions: {}
+        exploration_mode: adaptive
+        exploration_noise: 0.1
+        mutation_rate: 0.1
+        use_model_cache: True
+        force_retrain: False
+        validation_split: 0.1
+        use_finetuning: True
+        finetune_lr_scale: 0.5
+        finetune_epoch_scale: 0.5
+        finetune_min_epochs: 150
+        finetune_every_n_gens: 1
+        finetune_decay: 0.95
+        checkpoint_dir: running
+
+    HADES:
+        hidden_dims: 512
+        diffusion_steps: 1000
+        learning_rate: 0.00001
+        weight_decay: 0.0001
+        batch_size: 64
+        max_epochs: 10
+        layers: 6
+        dropout: 0.1
+        inference_steps: 50
+        guidance_scale: 4.0
+        fitness_embedding_scale: 1.0
+        top_k_percentile: 20
+        use_finetuning: True
+        finetune_lr_scale: 0.5
+        finetune_epoch_scale: 0.5
+        finetune_min_epochs: 10
+        finetune_every_n_gens: 1
+        finetune_decay: 0.95
+        checkpoint_dir: running

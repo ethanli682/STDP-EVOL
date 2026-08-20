@@ -1,0 +1,125 @@
+param:
+  blabla0:
+    type: float
+    # array: [3] # 3
+    # name: blabla0 
+    # round: 3
+    # min: -3.0
+    # max: 3.0
+    array: [500] # 3
+    name: blabla0 
+    round: 3
+    min: -1000.0
+    max: 1000.0
+    
+    default: 
+
+
+main:
+  Task_resource:
+    type: CPU
+    gpu: 0
+    cpu: 2
+    # theadsPerCore: 2
+    memory: '32GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: '' # 's1cmp010,s1cmp011,s1cmp013,s1cmp015,d1cmp007'
+    path: '/logs_Task'
+
+  Main_resource:
+    type: CPU
+    gpu: 0
+    cpu: 10
+    # theadsPerCore: 2
+    memory: '64GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: '' # 's1cmp010,s1cmp011,s1cmp013,s1cmp015,d1cmp007'
+    path: '/logs_Agent'
+
+ML:
+    RevFF_predictor:
+        use_log_scaler: True
+        top_k_percentile: 20
+        #ANN_Layers_size: None
+        dropout_rate: 0.2
+        epochs: 300
+        batch_size: 16
+        learning_rate: 0.001
+        early_stop_threshold: 0.05
+
+        min_epochs_before_early_stop: 10
+        allowed_architectures: ['ANN']
+        max_models_to_train: 1
+        validation: False
+        validation_split: 0.2
+        # gradient_clip: None
+        buffer_multiplier: 2
+
+    CMA_ES:
+        scaler_type: zscore
+        use_smoothing: True
+        diag_mode: auto
+        diag_mode_threshold: 4096
+        max_full_cov_gib: 32.0
+        
+    GA:
+        mutation_rate: 0.1
+        sigma: 0.1
+        crossover_prob: 0.5
+        
+    SNES:
+        scaler_type: rank
+        lr_mu: 1.0
+        lr_sigma: 1.0
+        
+    DiffEvo:
+        # Unconditional Diffusion Evolution (GA_class_DiffEvo_Claude.py)
+        num_steps: 25                # Denoising steps (T)
+        noise_scale: 0.5             # Mutation magnitude σ_m
+        latent_dim: auto             # Random projection dimension (auto, or int)
+        alpha_schedule: cosine       # Schedule type (cosine, linear)
+        top_k_percentile: 10         # What % to load
+        pool_size: auto              # Max population size (auto, or int)
+        min_datapoints: None         # Min genes to load
+        use_scaler: True             # Use fitness scaler
+       
+    HADES:
+        # Shared parameters (used by both Gemini and Claude conditional diffusion)
+        use_log_scaler: True
+        top_k_percentile: 20
+        hidden_dims: None            # Auto-sized: [256,128] for small, [512,256] for med, [1024,512,256] for large
+        diffusion_steps: 300
+        learning_rate: 0.001
+        weight_decay: 0.00001
+        batch_size: 32
+        max_epochs: 300
+        
+        # Fine-tuning controls (shared)
+        use_finetuning: True
+        finetune_lr_scale: 0.5
+        finetune_epoch_scale: 0.5
+        finetune_min_epochs: 150
+        finetune_every_n_gens: 1
+        finetune_decay: 0.95
+        checkpoint_dir: running
+        
+        # Claude-specific parameters (GA_class_CondEvo_Claude.py)
+        conditions: [fitness]
+        custom_conditions: {}
+        exploration_mode: adaptive   # adaptive, random, greedy
+        exploration_noise: 0.1
+        mutation_rate: 0.1
+        use_model_cache: True
+        force_retrain: False
+        validation_split: 0.1
+              
+        # Gemini-specific parameters (GA_class_CondEvo_Gemini.py)
+        layers: 6
+        dropout: 0.1
+        inference_steps: 50
+        guidance_scale: 4.0
+        fitness_embedding_scale: 1.0

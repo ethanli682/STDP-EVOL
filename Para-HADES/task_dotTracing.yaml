@@ -1,0 +1,274 @@
+# ===========================================================================
+# Hybrid EVOL + STDP-RL on the dot-tracing task.
+#
+# The gene IS the plastic weight vector. One array per plastic pathway, holding
+# one value per LIVE synapse. Connectivity is CONVERGENCE-based (each
+# postsynaptic neuron receives from exactly K presynaptic neurons), not
+# probabilistic, so the live-synapse count is deterministic and the EVOL and
+# STDP parameter vectors align exactly.
+#
+# ---------------------------------------------------------------------------
+# THE `array:` LENGTHS BELOW ARE DERIVED FROM dot_tracingtask.py. If you change
+# `ac`, `mc_pop`, `diag`, or either convergence, the lengths change and the task
+# will refuse to run. Regenerate and verify them with:
+#
+#     python dot_tracingtask.py --gene_lengths
+#
+# That command also cross-checks the `param:` block below against the config
+# and prints an ERROR line for any mismatch.
+#
+# Current values are for ac=400, diag=False (5 actions), mc_pop=40 -> n_mc=200:
+#     w_ac_mc = n_mc * ac_mc_convergence = 200 * 20 = 4000
+# (w_gc_ac would be ac * gc_ac_convergence = 400 * 25 = 10000, but GC->AC is
+#  NOT evolved here -- see `plastic:` below.)
+# ---------------------------------------------------------------------------
+#
+# min/max are the single source of truth for the weight box. They do three jobs:
+#   1. define the EVOL search range;
+#   2. define the STDP clamp range, so the two mechanisms cannot disagree about
+#      what a legal weight is;
+#   3. set the INITIAL weights -- Para-HADES draws generation 0 as
+#      N(midpoint, range/6) per synapse, so the box MIDPOINT is w_0.
+# They MUST equal main.DotTracing.w_min / w_max below.
+#
+# min MUST be 0.0: SNN weights have to stay non-negative.
+#
+# Do NOT use `default:` on these arrays. GA_class.py makes `default` OVERRIDE
+# the decoded gene with a constant, which would freeze the pathway and stop
+# EVOL touching it at all.
+#
+# The max value is NOT the paper's Table 2 conductance -- those are NEURON
+# units and do not transfer. Re-derive it after changing convergence, `ac`,
+# `mc_pop`, or the GC geometry:
+#
+#     python dot_tracingtask.py --calibrate
+# ===========================================================================
+
+param:
+  # AC -> MC is the ONLY evolved pathway.
+  w_ac_mc:
+    type: float
+    array: [4000]
+    name: AC_to_MC
+    round: 4
+    min: 0.0
+    max: 1.0
+    coevo_group: ac_mc
+
+main:
+  # -----------------------------------------------------------------------
+  # Everything dot_tracingtask.py reads. Unknown keys are warned about and
+  # ignored; anything omitted falls back to DEFAULT_CFG in dot_tracingtask.py.
+  # -----------------------------------------------------------------------
+  DotTracing:
+    # --- task / environment ---
+    steps: 100                  # decision steps per episode
+    dim: 28
+    granularity: 100            # ms of simulation per decision step
+    dt: 1.0
+    decay: 4
+    herrs: 0
+    diag: False                 # 9 actions if True, else 5
+    randr: 0.15
+    bound_hand: bounce
+    fit_func: dir
+    allow_stay: False
+    view_r: 14
+
+    # --- GC layer (fixed projection, never plastic, never evolved) ---
+    gc_scales: [3, 5, 7, 11, 13]
+    gc_rotations: 7
+    gc_offsets: 16              # 5 x 7 x 16 = 560 grid cells
+    gc_global_scale: 1.0
+    gc_sharpness: 1.0
+    gc_max_rate: 80.0           # 8 spikes per 100 ms decision window
+
+    # --- AC layer ---
+    ac: 400
+    gc_ac_convergence: 25       # presynaptic inputs per AC neuron
+    ac_gain: 14.0               # scales the FIXED GC->AC weights. If the
+                                # selftest reports AC nearly silent, raise it;
+                                # if saturated, lower it or raise rec_inh.
+    rec_mode: local             # none | random | local
+    rec_inh: 1.2
+    rec_radius: 4.0
+
+    # --- MC layer ---
+    mc_pop: 40                  # neurons per action subpopulation
+    ac_mc_convergence: 20       # presynaptic inputs per MC neuron
+                                # -> gene length = 200 * 20 = 4000
+
+    # --- model seed: fixes connectivity/topology for the WHOLE population.
+    # Vary it only to test robustness across model seeds.
+    model_seed: 0
+
+    # --- what EVOL optimizes ---
+    # ONLY ac_mc. Adding 'gc_ac' here requires also adding a w_gc_ac entry to
+    # `param:` above with array: [10000]; the task raises a KeyError otherwise.
+    plastic: [ac_mc]
+
+    # --- weight box. MUST match param.w_ac_mc min/max above. ---
+    w_min: 0.0
+    w_max: 1.0
+
+    # DESIGN DECISION -- 'darwinian' (A) or 'lamarckian' (B).
+    # (A) EVOL recombines only the gene it issued; STDP-learned weights are
+    #     discarded with the offspring (Baldwin effect). Works with stock
+    #     Para-HADES, no GA changes. Default.
+    # (B) post-STDP weights are returned as outP['gene_out_w_ac_mc']; folding
+    #     them back into the gene needs a post_fitness_hook (see below).
+    # Comparing them IS the experiment.
+    inheritance: darwinian
+
+    # --- STDP-RL: the lifetime learning ---
+    stdp_enabled: True
+    nu: 0.01                    # raise if --selftest says STDP is inert
+    eps_start: 0.0              # WTA + random-on-tie only; Poisson input is the
+    eps_min: 0.0                # exploration source, as in the paper
+    eps_decay: 1.0
+    select: wta                 # wta | softmax
+
+    # --- critic (hand-crafted, as in the paper; NOT evolved) ---
+    critic_mode: loss           # loss = paper's form on (distance, closing rate)
+                                # env  = the original alignment-scaled reward
+    max_reward: 1.0
+    eta_positivity: 5.0         # REQUIRED. Without it the critic is
+                                # punishment-dominated early and weights
+                                # collapse to zero.
+    eta_closing: 1.0            # analogue of the paper's eta_angvel
+    critic_gain: 1.0
+    success_eps: 0.01
+    critic_dist_scale: auto     # 'auto' = sqrt(2)*dim, the grid diagonal.
+                                # DO NOT set this to 1.0. Raw pixel distances
+                                # give per-step loss deltas of order 1-3, which
+                                # eta_positivity multiplies to 5-15, so every
+                                # step clips to +/-max_reward and the critic
+                                # collapses into a sign function. MSTDPET
+                                # modulates by reward MAGNITUDE, so that throws
+                                # the graded learning signal away. The paper
+                                # never hits this because CartPole's state
+                                # variables are radians (~0.26 max).
+
+    # --- weight normalization: MANDATORY with STDP live. Without it weights
+    # "tend to increase without bound, leading to epileptic activity".
+    # Intervals are in DECISION steps, not dt.
+    #
+    # NOTE reception balancing renormalizes to the sum of THIS OFFSPRING's
+    # starting weights, not a global w_0 -- otherwise it would silently undo
+    # the EVOL perturbation and the hybrid would collapse to plain STDP-RL.
+    norm_reception: True
+    reception_every: 25
+    norm_transmission: True
+    transmission_min: 0.1
+    transmission_max: 2.0
+    transmission_invert: False  # Potentiation and depression are scaled by
+                                # RECIPROCAL factors, so a source that already
+                                # transmits a lot is pushed back down, freeing
+                                # budget for quieter sources. Scaling both
+                                # directions by one factor would merely shrink
+                                # learning without redistributing it.
+                                # True reverses the asymmetry (rich-get-richer)
+                                # and exists only as an ablation to show the
+                                # normalization is doing something.
+    norm_homeostasis: True
+    homeostasis_every: 75
+    rate_window: 500
+    homeostasis_scale: 0.0001   # 0.01%
+    rate_target_ac: 5.5         # Hz (paper's EA target)
+    rate_target_mc: 6.0         # Hz (paper's EM target)
+
+    # --- lifetime / fitness ---
+    # RISK: do the arithmetic before a long run. At episodes=20 an offspring
+    # gets 20 x 100 steps x 100 ms = 200 s of simulated time, against roughly
+    # 25,000 s for the paper's standalone STDP-RL to converge. STDP may produce
+    # no measurable within-lifetime change, in which case the hybrid silently
+    # reduces to plain EVOL and the result is a null.
+    #
+    #     python dot_tracingtask.py --selftest
+    #
+    # reports ||w_final - w_start|| / ||w_start||. Under ~1% means inert.
+    episodes: 20
+    fitness_metric: intercepts  # intercepts | reward
+    fitness_last_k: 5           # logged variant (ii): post-learning ceiling
+    frozen_episodes: 5          # logged variant (iii): frozen held-out eval
+    episode_seed_base: 12345
+    seed_mode: common           # common -> all offspring in a generation face
+                                # the same episodes (common random numbers,
+                                # sharply lower ES fitness noise at P=10).
+                                # random -> fresh episodes per offspring.
+
+    gpu: False
+    cache_gc: True
+    verbose: True
+
+  Task_resource:
+    type: CPU
+    gpu: 0
+    cpu: 4
+    theadsPerCore: 2
+    memory: '16GB'
+    time: '00-11:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Task'
+
+  Main_resource:
+    type: CPU
+    gpu: 0
+    cpu: 16
+    theadsPerCore: 2
+    memory: '64GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Agent'
+
+# Only needed for inheritance: lamarckian. The hook receives each reportParam
+# and can copy outP['gene_out_w_ac_mc'] back into reportParam['gene'].
+# post_fitness_hook:
+#   module:   dot_tracing_hooks
+#   function: lamarckian_writeback
+
+ML:
+    # -------------------------------------------------------------------
+    # OpenAI-ES is the closest relative of the paper's EVOL: both are
+    # Salimans et al. style, mean-centred, fitness-weighted, no truncation
+    # selection -- every offspring contributes, including a negative-weighted
+    # term for below-average ones.
+    #
+    # Differences worth knowing: Para-HADES adds Adam, rank scaling, mirrored
+    # sampling and sigma decay. The paper's alpha = 1.0 is the coefficient of a
+    # plain ES step, NOT an Adam learning rate, so it does not transfer -- do
+    # not set learning_rate: 1.0. sigma = 0.1 IS the paper's value.
+    # -------------------------------------------------------------------
+    OpenAI_ES:
+        scaler_type: rank
+        learning_rate: auto     # per-group; auto clips to [0.003, 0.08]
+        sigma: 0.1              # the paper's perturbation scale
+        adam_beta1: 0.9
+        adam_beta2: 0.999
+        use_mirroring: True
+        sigma_decay: 0.999      # the paper uses NO decay; set 1.0 to match
+        random_injection_rate: 0.15
+        stagnation_window: 15
+        sigma_boost_factor: 2.0
+
+    CMA_ES:
+        scaler_type: rank
+        use_smoothing: True
+        diag_mode: auto
+        diag_mode_threshold: 4096
+        max_full_cov_gib: 32.0
+
+    SNES:
+        scaler_type: rank
+        lr_mu: 1.0
+        lr_sigma: 1.0
+
+    GA:
+        mutation_rate: 0.1
+        sigma: 0.1
+        crossover_prob: 0.5
+        scaler_type: rank

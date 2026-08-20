@@ -1,0 +1,91 @@
+param:
+  # Same gene shape as task_cogames_static.yaml (input=900, hidden=64,32, action=5).
+  # Hidden topology is duplicated here so the smoke config is self-contained.
+  W1:
+    type: float
+    array: [57600]     # 64 * 900
+    name: W1
+    round: 4
+    min: -3.0
+    max:  3.0
+    default:
+    coevo_group: W1
+
+  W2:
+    type: float
+    array: [2048]      # 32 * 64
+    name: W2
+    round: 4
+    min: -3.0
+    max:  3.0
+    default:
+    coevo_group: W2
+
+  W3:
+    type: float
+    array: [160]       # 5 * 32
+    name: W3
+    round: 4
+    min: -3.0
+    max:  3.0
+    default:
+    coevo_group: W3
+
+main:
+  StaticEval:
+    # SMOKE config (2026-05-08): same as task_cogames_static.yaml but
+    # eval_episodes=5 (not 40) for fast cluster-validation runs.
+    mission: arena
+    num_agents: 4
+    fitness_stat: composite_v5_role_event
+    eval_episodes: 5
+    seed_base: 12345
+    render: False
+    hidden: [64, 32]
+    fitness_v5:
+      w_F_heart:        5.0
+      w_F_chest:        5.0
+      w_F_ep:           3.0
+      w_B_ach_ore:      0.3
+      w_B_ach_gear:     0.5
+      w_B_role_events:  0.2
+      w_B_explore:      0.4
+      w_B_init:         0.0      # max reduction → init_loc is noise
+      score_B_cap:      3.0
+      reduction:        max
+
+  Task_resource:
+    type: CPU
+    gpu: 0
+    cpu: 2
+    memory: '32GB'
+    time: '00-04:00:00'           # tighter than production (was 23:59:59)
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Task'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/mettagrid.sif'
+
+  Main_resource:
+    type: CPU
+    gpu: 0
+    cpu: 4
+    memory: '64GB'
+    time: '00-04:00:00'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Agent'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'
+
+
+ML:
+    CMA_ES:
+        scaler_type: rank
+        use_smoothing: True
+        diag_mode: auto
+        diag_mode_threshold: 4096
+        max_full_cov_gib: 32.0
+        sigma_boost_factor: 1.0
+        sigma_max_restart: 1.5
+        initial_sigma: 0.1

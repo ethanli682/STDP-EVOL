@@ -1,0 +1,208 @@
+param:
+  # -----------------------------------------------------------------------
+  # Hebbian learning rule: ABCD_lr
+  # Δw_ij = (A * x_i * x_j) + (B * x_i) + (C * x_j) + D + lr_coeff
+  # where x_i = pre-synaptic, x_j = post-synaptic activity.
+  # E is an optional extra/neuromodulatory coefficient used by some variants.
+  #
+  # Search ranges follow the HebbianMetaLearning paper defaults.
+  # Tighten min/max once good regions are found.
+  # -----------------------------------------------------------------------
+  A:
+    type: float
+    array: [91328]      # one A coefficient per FC synapse
+    name: A
+    round: 4
+    min: -10.0
+    max:  10.0
+    default:
+    coevo_group: A
+
+  B:
+    type: float
+    array: [91328]      # one B coefficient per FC synapse
+    name: B
+    round: 4
+    min: -10.0
+    max:  10.0
+    default:
+    coevo_group: B
+
+  C:
+    type: float
+    array: [91328]      # one C coefficient per FC synapse
+    name: C
+    round: 4
+    min: -10.0
+    max:  10.0
+    default:
+    coevo_group: C
+
+  D:
+    type: float
+    array: [91328]      # one D coefficient per FC synapse
+    name: D
+    round: 4
+    min: -10.0
+    max:  10.0
+    default:
+    coevo_group: D
+
+  lr:
+    type: float
+    array: [91328]      # one learning-rate per FC synapse
+    name: lr
+    round: 5
+    min: -1
+    max: 1
+    default:
+    coevo_group: lr
+
+  cnn:
+    type: float
+    array: [1362]       # conv1: 6x3x3x3=162, conv2: 8x6x5x5=1200 (flat, in order)
+    name: cnn
+    round: 4
+    min: -0.5
+    max:  0.5           # narrower CNN init range to reduce immediate policy saturation
+    default:
+    coevo_group: cnn
+
+main:
+  HebEval:
+    eval_episodes: 3
+    seed_base: 12345
+    render: False
+
+  Task_resource:
+    type: CPU
+    gpu: 0
+    cpu: 2
+    # theadsPerCore: 2
+    memory: '32GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: '' # 's1cmp010,s1cmp011,s1cmp013,s1cmp015,d1cmp007'
+    path: '/logs_Task'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/Heb.sif'
+
+
+  Main_resource:
+    type: CPU
+    gpu: 0
+    cpu: 10
+    # theadsPerCore: 2
+    memory: '128GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: '' # 's1cmp010,s1cmp011,s1cmp013,s1cmp015,d1cmp007'
+    path: '/logs_Agent'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'
+
+
+ML:
+    RevFF_predictor:
+        use_log_scaler: False
+        top_k_percentile: 20
+        #ANN_Layers_size: None
+        dropout_rate: 0.2
+        epochs: 300
+        batch_size: 16
+        learning_rate: 0.001
+        early_stop_threshold: 0.05
+
+        min_epochs_before_early_stop: 10
+        allowed_architectures: ['ANN']
+        max_models_to_train: 1
+        validation: False
+        validation_split: 0.2
+        # gradient_clip: None
+        buffer_multiplier: 2
+
+    CMA_ES:
+        scaler_type: rank
+        use_smoothing: True
+        diag_mode: auto
+        diag_mode_threshold: 4096
+        max_full_cov_gib: 32.0
+       
+        
+    GA:
+        mutation_rate: 0.1
+        sigma: 0.1
+        crossover_prob: 0.5
+        scaler_type: rank
+        
+    SNES:
+        scaler_type: rank
+        lr_mu: 1.0
+        lr_sigma: 1.0
+        
+    DiffusionEvo:
+        # ========== ALGORITHM SELECTION ==========
+        algorithm: conditional    # Options: "conditional" or "unconditional"
+        
+        # ========== SHARED PARAMETERS (both algorithms) ==========
+        use_log_scaler: True      # Use log scaler for fitness (vs rank scaler)
+        top_k_percentile: 20      # Top % of genes to load for learning
+        
+        # ========== UNCONDITIONAL PARAMETERS (algorithm=unconditional) ==========
+        # Evolutionary diffusion without training
+        num_steps: 100             # Denoising steps (T)
+        noise_scale: 0.5          # Mutation magnitude σ_m ∈ [0, 1]
+        latent_dim: auto          # Latent projection dim (auto, or int)
+        alpha_schedule: cosine    # Schedule type (cosine, linear, ddpm)
+        pool_size: auto           # Max population size (auto, or int)
+        min_datapoints: None      # Min genes to load before starting
+        
+        # ========== CONDITIONAL PARAMETERS (algorithm=conditional) ==========
+        # Neural network trained on historical data
+        hidden_dims: None         # Network layers (auto-sized if None)
+        diffusion_steps: 100      # Training diffusion steps
+        learning_rate: 0.001
+        weight_decay: 0.00001
+        batch_size: 32
+        max_epochs: 777
+        conditions: [fitness]     # Conditioning information
+        custom_conditions: {}
+        exploration_mode: adaptive   # adaptive, random, greedy
+        exploration_noise: 0.1
+        mutation_rate: 0.1
+        use_model_cache: True
+        force_retrain: False
+        validation_split: 0.1
+        
+        # ========== FINE-TUNING CONTROLS ==========
+        use_finetuning: True
+        finetune_lr_scale: 0.5
+        finetune_epoch_scale: 0.5
+        finetune_min_epochs: 150
+        finetune_every_n_gens: 1
+        finetune_decay: 0.95
+        checkpoint_dir: running
+    
+    HADES:
+        # Gemini conditional diffusion parameters (GA_class_CondEvo_Gemini.py)
+        hidden_dims: 512             # Network hidden dim (int for Gemini)
+        diffusion_steps: 1000
+        learning_rate: 0.00001
+        weight_decay: 0.0001
+        batch_size: 64
+        max_epochs: 10
+        layers: 6
+        dropout: 0.1
+        inference_steps: 50
+        guidance_scale: 4.0
+        fitness_embedding_scale: 1.0
+        top_k_percentile: 20
+        
+        # Fine-tuning controls
+        use_finetuning: True
+        finetune_lr_scale: 0.5
+        finetune_epoch_scale: 0.5
+        finetune_min_epochs: 10
+        finetune_every_n_gens: 1
+        finetune_decay: 0.95
+        checkpoint_dir: running

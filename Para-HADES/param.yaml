@@ -1,0 +1,56 @@
+
+blabla0:
+  min: 0.0
+  max: 1000.0
+  type: float
+  round: 2
+  array: [2]
+  name: blabla0 
+  default: 
+
+blabla_default0:
+  min: 0.0
+  max: 1000.0
+  type: float
+  round: 2
+  array: [2]
+  name: blabla_default0
+  default: 0.0, 1.0
+
+blabla_int_default0:
+  min: -100
+  max: 100
+  type: int
+  round: 
+  array: [2]
+  name: blabla_int_default0
+  default: 0, 1
+
+blabla_int0:
+  min: -100
+  max: 100
+  type: int
+  round: 0
+  array: [2]
+  name: blabla_int0
+  default: 
+
+blabla1_float_default0:
+  min: 0.0
+  max: 1000.0
+  type: float
+  round: 
+  array: 
+  name: blabla1_float_default0
+  default: 12.345
+
+  blabla1_float:
+  min: 0.0
+  max: 1000.0
+  type: float
+  round: 3
+  array: 
+  name: blabla1_float
+  default: 
+
+

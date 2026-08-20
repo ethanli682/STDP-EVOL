@@ -1,0 +1,1295 @@
+from abc import ABC, abstractmethod
+from bindsnet.learning.learning import NoOp
+from typing import Union, Tuple, Optional, Sequence
+
+import numpy as np
+import torch
+import warnings
+from torch import device
+from torch.nn import Parameter
+import torch.nn.functional as F
+import torch.nn as nn
+import bindsnet.learning
+
+
+class AbstractFeature(ABC):
+    # language=rst
+    """
+    Features to operate on signals traversing a connection.
+    """
+
+    @abstractmethod
+    def __init__(
+        self,
+        name: str,
+        value: Union[torch.Tensor, float, int] = None,
+        value_dtype: torch.dtype = torch.float32,
+        range: Optional[Union[list, tuple]] = None,
+        clamp_frequency: Optional[int] = 1,
+        norm: Optional[Union[torch.Tensor, float, int]] = None,
+        learning_rule: Optional[bindsnet.learning.LearningRule] = None,
+        nu: Optional[Union[list, tuple, int, float]] = None,
+        reduction: Optional[callable] = None,
+        enforce_polarity: Optional[bool] = False,
+        decay: float = 0.0,
+        parent_feature=None,
+        sparse: Optional[bool] = False,
+        batch_size: int = 1,
+        **kwargs,
+    ) -> None:
+        # language=rst
+        """
+        Instantiates a :code:`Feature` object. Will assign all incoming arguments as class variables
+        :param name: Name of the feature
+        :param value: Core numeric object for the feature. This parameters function will vary depending on the feature
+        :param value_dtype: Data type for :code:`value` tensor
+        :param range: Range of acceptable values for the :code:`value` parameter
+        :param norm: Value which all values in :code:`value` will sum to. Normalization of values occurs after each
+            sample and after the value has been updated by the learning rule (if there is one)
+        :param learning_rule: Rule which will modify the :code:`value` after each sample
+        :param nu: Learning rate for the learning rule
+        :param reduction: Method for reducing parameter updates along the minibatch
+            dimension
+        :param decay: Constant multiple to decay weights by on each iteration
+        :param parent_feature: Parent feature to inherit :code:`value` from
+        :param sparse: Should :code:`value` parameter be sparse tensor or not
+        :param batch_size: Mini-batch size.
+        """
+
+        #### Initialize class variables ####
+        ## Args ##
+        self.name = name
+        self.value = value
+        self.range = [-1.0, 1.0] if range is None else range
+        self.clamp_frequency = clamp_frequency
+        self.norm = norm
+        self.learning_rule = learning_rule
+        self.nu = nu
+        self.reduction = reduction
+        self.decay = decay
+        self.parent_feature = parent_feature
+        self.sparse = sparse
+        self.batch_size = batch_size
+        self.kwargs = kwargs
+
+        ## Backend ##
+        self.is_primed = False
+
+        from ..learning.MCC_learning import (
+            NoOp,
+            PostPre,
+            MSTDP,
+            MSTDPET,
+        )
+
+        supported_rules = [
+            NoOp,
+            PostPre,
+            MSTDP,
+            MSTDPET,
+        ]
+
+        #### Assertions ####
+        # Assert correct instance of feature values
+        assert isinstance(name, str), "Feature {0}'s name should be of type str".format(
+            name
+        )
+        assert value is None or isinstance(
+            value, (torch.Tensor, float, int)
+        ), "Feature {0} should be of type float, int, or torch.Tensor, not {1}".format(
+            name, type(value)
+        )
+        assert norm is None or isinstance(
+            norm, (torch.Tensor, float, int)
+        ), "Feature {0}'s norm should be of type float, int, or torch.Tensor, not {1}".format(
+            name, type(norm)
+        )
+        assert learning_rule is None or (
+            learning_rule in supported_rules
+        ), "Feature {0}'s learning_rule should be of type bindsnet.LearningRule not {1}".format(
+            name, type(learning_rule)
+        )
+        assert nu is None or isinstance(
+            nu, (list, tuple)
+        ), "Feature {0}'s nu should be of type list or tuple, not {1}".format(
+            name, type(nu)
+        )
+        assert reduction is None or isinstance(
+            reduction, callable
+        ), "Feature {0}'s reduction should be of type callable, not {1}".format(
+            name, type(reduction)
+        )
+        assert decay is None or isinstance(
+            decay, float
+        ), "Feature {0}'s decay should be of type float, not {1}".format(
+            name, type(decay)
+        )
+
+        self.assert_valid_range()
+        if value is None:
+            return
+
+        self.assert_feature_in_range()
+        self.value = self.cast_dtype_if_needed(self.value, value_dtype)
+        if not self.sparse:
+            return
+
+        if len(self.value.shape) == 2:
+            self.value = self.value.unsqueeze(0).repeat(self.batch_size, 1, 1)
+
+        self.value = self.value.to_sparse()
+        assert not getattr(
+            self, "enforce_polarity", False
+        ), "enforce_polarity isn't supported for sparse tensors"
+
+    @staticmethod
+    def cast_dtype_if_needed(value, value_dtype):
+        if value.dtype != value_dtype:
+            warnings.warn(
+                f"Provided value has data type {value.dtype} but parameter w_dtype is {value_dtype}"
+            )
+            return value.to(dtype=value_dtype)
+        else:
+            return value
+
+    @abstractmethod
+    def reset_state_variables(self) -> None:
+        # language=rst
+        """
+        Contains resetting logic for the feature.
+        """
+        if self.learning_rule:
+            self.learning_rule.reset_state_variables()
+        pass
+
+    @abstractmethod
+    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+        # language=rst
+        """
+        Computes the feature being operated on a set of incoming signals.
+        """
+        pass
+
+    def prime_feature(self, connection, device, **kwargs) -> None:
+        # language=rst
+        """
+        Prepares a feature after it has been placed in a connection. This takes care of learning rules, feature
+        value initialization, and asserting that features have proper shape. Should occur after primary constructor.
+        """
+
+        # Note: DO NOT move NoOp to global; cyclical dependency
+        from ..learning.MCC_learning import NoOp
+
+        # Check if feature is already primed
+        if self.is_primed:
+            return
+        self.is_primed = True
+
+        # Check if feature is a child feature
+        if self.parent_feature is not None:
+            self.link(self.parent_feature)
+            self.learning_rule = NoOp(connection=connection)
+            return
+
+        # Check if values/norms are the correct shape
+        if isinstance(self.value, torch.Tensor):
+            if self.sparse:
+                assert tuple(self.value.shape[1:]) == (
+                    connection.source.n,
+                    connection.target.n,
+                )
+            else:
+                assert tuple(self.value.shape) == (
+                    connection.source.n,
+                    connection.target.n,
+                )
+
+        if self.norm is not None and isinstance(self.norm, torch.Tensor):
+            assert self.norm.shape[0] == connection.target.n
+
+        #### Initialize feature value ####
+        if self.value is None:
+            self.value = (
+                self.initialize_value()
+            )  # This should be defined per the sub-class
+
+        if isinstance(self.value, (int, float)):
+            self.value = torch.Tensor([self.value])
+
+        # Parameterize and send to proper device
+        # Note: Floating is used here to avoid dtype conflicts
+        self.value = Parameter(self.value, requires_grad=False).to(device)
+
+        ##### Initialize learning rule #####
+
+        # Default is NoOp
+        if self.learning_rule is None:
+            self.learning_rule = NoOp
+
+        self.learning_rule = self.learning_rule(
+            connection=connection,
+            feature_value=self.value,
+            range=self.range,
+            nu=self.nu,
+            reduction=self.reduction,
+            decay=self.decay,
+            **kwargs,
+        )
+
+        #### Recycle unnecessary variables ####
+        del self.nu, self.reduction, self.decay, self.range
+
+    def update(self, **kwargs) -> None:
+        # language=rst
+        """
+        Compute feature's update rule
+        """
+
+        self.learning_rule.update(**kwargs)
+
+    def normalize(self) -> None:
+        # language=rst
+        """
+        Normalize feature so each target neuron has sum of feature values equal to
+        ``self.norm``.
+        """
+
+        if self.norm is not None:
+            if self.sparse:
+                abs_sum = self.value.sum(1).to_dense()
+                abs_sum[abs_sum == 0] = 1.0
+                abs_sum = abs_sum.unsqueeze(1).expand(-1, *self.value.shape[1:])
+                self.value = self.value * (self.norm / abs_sum)
+            else:
+                abs_sum = self.value.sum(0).unsqueeze(0)
+                abs_sum[abs_sum == 0] = 1.0
+                self.value *= self.norm / abs_sum
+
+    def degrade(self) -> None:
+        # language=rst
+        """
+        Degrade the value of the propagated spikes according to the features value. A lambda function should be passed
+        into the constructor which takes a single argument (which represent the value), and returns a value which will
+        be *subtracted* from the propagated spikes.
+        """
+
+        return self.degrade(self.value)
+
+    def link(self, parent_feature) -> None:
+        # language=rst
+        """
+        Allow two features to share tensor values
+        """
+
+        valid_features = (Probability, Weight, Bias, Delay, Intensity)
+
+        assert isinstance(self, valid_features), f"A {self} cannot use feature linking"
+        assert isinstance(
+            parent_feature, valid_features
+        ), f"A {parent_feature} cannot use feature linking"
+        assert self.is_primed, f"Prime feature before linking: {self}"
+        assert (
+            parent_feature.is_primed
+        ), f"Prime parent feature before linking: {parent_feature}"
+
+        # Link values, disable learning for this feature
+        self.value = parent_feature.value
+        self.learning_rule = NoOp
+
+    def assert_valid_range(self):
+        # language=rst
+        """
+        Default range verifier (within [-1, +1])
+        """
+
+        r = self.range
+
+        ## Check dtype ##
+        assert isinstance(
+            self.range, (list, tuple)
+        ), f"Invalid range for feature {self.name}: range should be a list or tuple, not {type(self.range)}"
+        assert (
+            len(r) == 2
+        ), f"Invalid range for feature {self.name}: range should have a length of 2"
+
+        ## Check min/max relation ##
+        if isinstance(r[0], torch.Tensor) or isinstance(r[1], torch.Tensor):
+            assert (
+                r[0] < r[1]
+            ).all(), f"Invalid range for feature {self.name}: a min is larger than an adjacent max"
+        else:
+            assert (
+                r[0] < r[1]
+            ), f"Invalid range for feature {self.name}: the min value is larger than the max value"
+
+    def assert_feature_in_range(self):
+        r = self.range
+        f = self.value
+
+        if isinstance(r[0], torch.Tensor) or isinstance(f, torch.Tensor):
+            assert (
+                f >= r[0]
+            ).all(), f"Feature out of range for {self.name}: Features values not in [{r[0]}, {r[1]}]"
+        else:
+            assert (
+                f >= r[0]
+            ), f"Feature out of range for {self.name}: Features values not in [{r[0]}, {r[1]}]"
+
+        if isinstance(r[1], torch.Tensor) or isinstance(f, torch.Tensor):
+            assert (
+                f <= r[1]
+            ).all(), f"Feature out of range for {self.name}: Features values not in [{r[0]}, {r[1]}]"
+        else:
+            assert (
+                f <= r[1]
+            ), f"Feature out of range for {self.name}: Features values not in [{r[0]}, {r[1]}]"
+
+    def assert_valid_shape(self, source_shape, target_shape, f):
+        # Multidimensional feat
+        if (not self.sparse and len(f.shape) > 1) or (
+            self.sparse and len(f.shape[1:]) > 1
+        ):
+            if self.sparse:
+                f_shape = f.shape[1:]
+                expected = ("batch_size", source_shape, target_shape)
+            else:
+                f_shape = f.shape
+                expected = (source_shape, target_shape)
+            assert f_shape == (
+                source_shape,
+                target_shape,
+            ), f"Feature {self.name} has an incorrect shape of {f.shape}. Should be of shape {expected}"
+        # Else assume scalar, which is a valid shape
+
+
+class Probability(AbstractFeature):
+    def __init__(
+        self,
+        name: str,
+        value: Union[torch.Tensor, float, int] = None,
+        value_dtype: torch.dtype = torch.float32,
+        range: Optional[Sequence[float]] = None,
+        norm: Optional[Union[torch.Tensor, float, int]] = None,
+        learning_rule: Optional[bindsnet.learning.LearningRule] = None,
+        nu: Optional[Union[list, tuple]] = None,
+        reduction: Optional[callable] = None,
+        decay: float = 0.0,
+        parent_feature=None,
+        sparse: Optional[bool] = False,
+        batch_size: int = 1,
+    ) -> None:
+        # language=rst
+        """
+        Will run a bernoulli trial using :code:`value` to determine if a signal will successfully traverse the synapse
+        :param name: Name of the feature
+        :param value: Number(s) in [0, 1] which represent the probability of a signal traversing a synapse. Tensor values
+            assume that probabilities will be matched to adjacent synapses in the connection. Scalars will be applied to
+            all synapses.
+        :param value_dtype: Data type for :code:`value` tensor
+        :param range: Range of acceptable values for the :code:`value` parameter. Should be in [0, 1]
+        :param norm: Value which all values in :code:`value` will sum to. Normalization of values occurs after each sample
+            and after the value has been updated by the learning rule (if there is one)
+        :param learning_rule: Rule which will modify the :code:`value` after each sample
+        :param nu: Learning rate for the learning rule
+        :param reduction: Method for reducing parameter updates along the minibatch
+            dimension
+        :param decay: Constant multiple to decay weights by on each iteration
+        :param parent_feature: Parent feature to inherit :code:`value` from
+        :param sparse: Should :code:`value` parameter be sparse tensor or not
+        :param batch_size: Mini-batch size.
+        """
+
+        ### Assertions ###
+        super().__init__(
+            name=name,
+            value=value,
+            value_dtype=value_dtype,
+            range=[0, 1] if range is None else range,
+            norm=norm,
+            learning_rule=learning_rule,
+            nu=nu,
+            reduction=reduction,
+            decay=decay,
+            parent_feature=parent_feature,
+            sparse=sparse,
+            batch_size=batch_size,
+        )
+
+    def sparse_bernoulli(self):
+        values = torch.bernoulli(self.value.values())
+        mask = values != 0
+        indices = self.value.indices()[:, mask]
+        non_zero = values[mask]
+        return torch.sparse_coo_tensor(indices, non_zero, self.value.size())
+
+    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+        if self.sparse:
+            return conn_spikes * self.sparse_bernoulli()
+        else:
+            return conn_spikes * torch.bernoulli(self.value)
+
+    def reset_state_variables(self) -> None:
+        pass
+
+    def prime_feature(self, connection, device, **kwargs) -> None:
+        ## Initialize value ###
+        if self.value is None:
+            self.initialize_value = lambda: torch.clamp(
+                torch.rand(connection.source.n, connection.target.n, device=device),
+                self.range[0],
+                self.range[1],
+            )
+
+        super().prime_feature(connection, device, **kwargs)
+
+    def assert_valid_range(self):
+        super().assert_valid_range()
+
+        r = self.range
+
+        ## Check min greater than 0 ##
+        if isinstance(r[0], torch.Tensor):
+            assert (
+                r[0] >= 0
+            ).all(), (
+                f"Invalid range for feature {self.name}: a min value is less than 0"
+            )
+        elif isinstance(r[0], (float, int)):
+            assert (
+                r[0] >= 0
+            ), f"Invalid range for feature {self.name}: the min value is less than 0"
+        else:
+            assert (
+                False
+            ), f"Invalid range for feature {self.name}: the min value must be of type torch.Tensor, float, or int"
+
+
+class Mask(AbstractFeature):
+    def __init__(
+        self,
+        name: str,
+        value: Union[torch.Tensor, float, int] = None,
+        sparse: Optional[bool] = False,
+        batch_size: int = 1,
+    ) -> None:
+        # language=rst
+        """
+        Boolean mask which determines whether or not signals are allowed to traverse certain synapses.
+        :param name: Name of the feature
+        :param value: Boolean mask. :code:`True` means a signal can pass, :code:`False` means the synapse is impassable
+        :param sparse: Should :code:`value` parameter be sparse tensor or not
+        :param batch_size: Mini-batch size.
+        """
+
+        ### Assertions ###
+        if isinstance(value, torch.Tensor):
+            assert (
+                value.dtype == torch.bool
+            ), "Mask must be of type bool, not {}".format(value.dtype)
+        elif value is not None:
+            assert isinstance(value, bool), "Mask must be of type bool, not {}".format(
+                value.dtype
+            )
+
+            # Send boolean to tensor (priming wont work if it's not a tensor)
+            value = torch.tensor(value)
+
+        super().__init__(
+            name=name,
+            value=value,
+            value_dtype=torch.bool,
+            sparse=sparse,
+            batch_size=batch_size,
+        )
+        self.name = name
+        self.value = value
+
+    def compute(self, conn_spikes) -> torch.Tensor:
+        return conn_spikes * self.value
+
+    def reset_state_variables(self) -> None:
+        pass
+
+    def prime_feature(self, connection, device, **kwargs) -> None:
+        # Check if feature is already primed
+        if self.is_primed:
+            return
+        self.is_primed = True
+
+        #### Initialize feature value ####
+        if self.value is None:
+            self.value = (
+                torch.rand(connection.source.n, connection.target.n) > 0.99
+            ).to(device=device)
+        self.value = Parameter(self.value, requires_grad=False).to(device)
+
+        #### Assertions ####
+        # Check if tensor values are the correct shape
+        if isinstance(self.value, torch.Tensor):
+            self.assert_valid_shape(
+                connection.source.n, connection.target.n, self.value
+            )
+
+        ##### Initialize learning rule #####
+        # Note: DO NOT move NoOp to global; cyclical dependency
+        from ..learning.MCC_learning import NoOp
+
+        # Default is NoOp
+        if self.learning_rule is None:
+            self.learning_rule = NoOp
+
+        self.learning_rule = self.learning_rule(
+            connection=connection,
+            feature=self.value,
+            range=self.range,
+            nu=self.nu,
+            reduction=self.reduction,
+            decay=self.decay,
+            **kwargs,
+        )
+
+
+class Delay(AbstractFeature):
+    def __init__(
+        self,
+        name: str,
+        value: Union[torch.Tensor, float, int] = None,
+        range: Optional[Sequence[float]] = None,
+        norm: Optional[Union[torch.Tensor, float, int]] = None,
+        learning_rule: Optional[bindsnet.learning.LearningRule] = None,
+        nu: Optional[Union[list, tuple]] = None,
+        reduction: Optional[callable] = None,
+        decay: float = 0.0,
+        max_delay: Optional[int] = 32,
+        delay_decay: Optional[float] = 0,  # TODO: Make this global + lambda
+        drop_late_spikes: Optional[bool] = False,
+        refractory: Optional[bool] = False,  # TODO: Change this name
+        normalize_delays: Optional[
+            bool
+        ] = False,  # force normalize delays instead of clipping
+    ) -> None:
+        # language=rst
+        """
+        Delays outgoing signals based on the values of :code:`value` and :code:`max_delay`. Delays are calculated as
+        being :code:`value` * :code:`max_delay`, where :code: `value` is in range [0, 1]
+        :param name: Name of the feature
+        :param value: Unscaled delays. Unscaled implies that these values are in [0, 1], and will be multiplied by :code:`max_delay` to determine delay time
+        :param range: Range of acceptable values for the :code:`value` parameter
+        :param norm: Value which all values in :code:`value` will sum to. Normalization of values occurs after each sample
+            and after the value has been updated by the learning rule (if there is one)
+        :param learning_rule: Rule which will modify the :code:`value` after each sample
+        :param nu: Learning rate for the learning rule
+        :param reduction: Method for reducing parameter updates along the minibatch
+            dimension
+        :param decay: Constant multiple to decay weights by on each iteration
+        :param max_delay: Maximum possible delay
+        :param delay_decay: Decay :code:`value` by this amount every time step
+        :param drop_late_spikes: Surpress spikes when delay is at maximum
+        :param refractory: Block spikes in synapse until earlier ones pass
+        :param normalize: Force normalize delay every run instead of clipping values
+        """
+
+        ### Assertions ###
+        super().__init__(
+            name=name,
+            value=value,
+            range=[0,1],       # note: Value isn't used, not 'None' to avoid errors
+            norm=norm,
+            learning_rule=learning_rule,
+            nu=nu,
+            reduction=reduction,
+            decay=decay,
+        )
+        self.max_delay = max_delay
+        self.delay_decay = delay_decay
+        self.drop_late_spikes = drop_late_spikes
+        self.refractory = refractory
+        self.normalize_delays = normalize_delays
+
+    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+        value = self.value.clone().detach().flatten()
+        if self.normalize_delays:
+            # force normalize delay values
+            tmp_min, tmp_max = torch.min(value), torch.max(value)
+            if tmp_max > 1 or tmp_min < 0:
+                value = (value - tmp_min) / (tmp_max - tmp_min)
+        else:
+            # force clip delay values
+            value = torch.clamp(value, 0, 1)
+
+        # Generate new delays for insertion into buffers
+        delays = ((1 - value) * (self.max_delay - 1)).long()
+
+        if self.refractory:
+            # TODO: Is there a reason why this is in here?
+            if self.drop_late_spikes:
+                conn_spikes[delays == self.max_delay] = 0
+
+            # Prevent additional spikes if one is already on the synapse
+            conn_spikes &= self.refrac_count <= 0
+            self.refrac_count -= 1
+            bool_spikes = conn_spikes.bool()
+            self.refrac_count[bool_spikes] = delays[bool_spikes]
+
+        # add circular time index to delays
+        # TODO: Dead spikes of delay = self.dmax don't properly die if self.time_idx > 0
+        delays = (delays + self.time_idx) % self.max_delay
+
+        # Fill the delay buffer, according to connection delays
+        # |delay_buffer| = [source.n * target.n, max_delay]
+        # TODO: Can we remove .float() for performance? (Change delay buffer type?)
+        flattened_conn_spikes = conn_spikes.flatten().float()
+        self.delay_buffer[self.delays_idx, delays] = flattened_conn_spikes  # .bool()
+
+        # Outgoing signal is spikes scheduled to fire at time_idx
+        # TODO: Detach + Clone likely not efficient as passing reference to buffer at current time index; efficiency
+        out_signal = (
+            self.delay_buffer[:, self.time_idx]
+            .view(self.source_n, self.target_n)
+            .detach()
+            .clone()
+        )
+
+        # Clear transmitted spikes
+        self.delay_buffer[:, self.time_idx] = 0.0
+
+        # Suppress max delays
+        if self.drop_late_spikes and not self.refractory:
+            late_spikes_time = (self.time_idx - 1) % self.max_delay
+            self.delay_buffer[:, late_spikes_time] = 0.0
+
+        # Increment circular time pointer
+        self.time_idx = (self.time_idx + 1) % self.max_delay
+
+        # TODO: Remember to move this to global
+        # Decay
+        if self.delay_decay:
+            self.delay_buffer = self.delay_buffer - self.delay_decay.to("cuda")
+            self.delay_buffer[
+                self.delay_decay < 0
+            ] = 0  # TODO: Determine if this is faster than clamp(min=0)
+
+        return out_signal
+
+    def reset_state_variables(self) -> None:
+        super().reset_state_variables()
+
+        # Reset time index and empty buffer
+        self.time_idx = 0
+        self.delay_buffer.zero_()
+
+    def prime_feature(self, connection, device, **kwargs) -> None:
+        #### Initialize value ####
+        if self.value is None:
+            self.initialize_value = lambda: torch.clamp(
+                torch.rand(
+                    (connection.source.n, connection.target.n),
+                    dtype=torch.float32,
+                    device=device,
+                ),
+                self.range[0],
+                self.range[1],
+            )
+        else:
+            self.value = self.value.to(torch.float32).to(device)
+
+        super().prime_feature(connection, device, **kwargs)
+
+        #### Initialize additional class variables ####
+        self.delays_idx = torch.arange(
+            0, connection.source.n * connection.target.n, dtype=torch.int32
+        ).to(device)
+        self.delay_buffer = torch.zeros(
+            connection.source.n * connection.target.n,
+            self.max_delay,
+            dtype=torch.float32,
+        ).to(device)
+        self.time_idx = 0
+        self.source_n = connection.source.n
+        self.target_n = connection.target.n
+
+        # Tensor necessary for interaction with delay buffer
+        if self.delay_decay:
+            self.delay_decay = torch.tensor([self.delay_decay])
+
+        if self.refractory:
+            self.refrac_count = torch.zeros(
+                connection.source.n * connection.target.n,
+                dtype=torch.long,
+                device=device,
+            )
+
+    def assert_valid_range(self):
+        super().assert_valid_range()
+
+        r = self.range
+
+        ## Check min greater than 0 ##
+        if isinstance(r[0], torch.Tensor):
+            assert (
+                r[0] >= 0
+            ).all(), (
+                f"Invalid range for feature {self.name}: a min value is less than 0"
+            )
+        elif isinstance(r[0], (float, int)):
+            assert (
+                r[0] >= 0
+            ), f"Invalid range for feature {self.name}: the min value is less than 0"
+        else:
+            assert (
+                False
+            ), f"Invalid range for feature {self.name}: the min value must be of type torch.Tensor, float, or int"
+
+
+class MeanField(AbstractFeature):
+    def __init__(self) -> None:
+        # language=rst
+        """
+        Takes the mean of all outgoing signals, and outputs that mean across every synapse in the connection
+        """
+        pass
+
+    def reset_state_variables(self) -> None:
+        pass
+
+    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+        return conn_spikes.mean() * torch.ones(
+            self.source_n * self.target_n, device=self.device
+        )
+
+    def prime_feature(self, connection, device, **kwargs) -> None:
+        self.source_n = connection.source.n
+        self.target_n = connection.target.n
+
+        super().prime_feature(connection, device, **kwargs)
+
+
+class Weight(AbstractFeature):
+    def __init__(
+        self,
+        name: str,
+        value: Union[torch.Tensor, float, int] = None,
+        value_dtype: torch.dtype = torch.float32,
+        range: Optional[Sequence[float]] = None,
+        norm: Optional[Union[torch.Tensor, float, int]] = None,
+        norm_frequency: Optional[str] = "sample",
+        learning_rule: Optional[bindsnet.learning.LearningRule] = None,
+        nu: Optional[Union[list, tuple]] = None,
+        reduction: Optional[callable] = None,
+        enforce_polarity: Optional[bool] = False,
+        decay: float = 0.0,
+        sparse: Optional[bool] = False,
+        batch_size: int = 1,
+    ) -> None:
+        # language=rst
+        """
+        Multiplies signals by scalars
+        :param name: Name of the feature
+        :param value: Values to scale signals by
+        :param value_dtype: Data type for :code:`value` tensor
+        :param range: Range of acceptable values for the :code:`value` parameter
+        :param norm: Value which all values in :code:`value` will sum to. Normalization of values occurs after each sample
+            and after the value has been updated by the learning rule (if there is one)
+        :param norm_frequency: How often to normalize weights:
+            * 'sample': weights normalized after each sample
+            * 'time step': weights normalized after each time step
+        :param learning_rule: Rule which will modify the :code:`value` after each sample
+        :param nu: Learning rate for the learning rule
+        :param reduction: Method for reducing parameter updates along the minibatch
+            dimension
+        :param enforce_polarity: Will prevent synapses from changing signs if :code:`True`
+        :param decay: Constant multiple to decay weights by on each iteration
+        :param sparse: Should :code:`value` parameter be sparse tensor or not
+        :param batch_size: Mini-batch size.
+        """
+
+        self.norm_frequency = norm_frequency
+        self.enforce_polarity = enforce_polarity
+        super().__init__(
+            name=name,
+            value=value,
+            value_dtype=value_dtype,
+            range=[-torch.inf, +torch.inf] if range is None else range,
+            norm=norm,
+            learning_rule=learning_rule,
+            nu=nu,
+            reduction=reduction,
+            decay=decay,
+            sparse=sparse,
+            batch_size=batch_size,
+        )
+
+    def reset_state_variables(self) -> None:
+        pass
+
+    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+        if self.enforce_polarity:
+            pos_mask = ~torch.logical_xor(self.value > 0, self.positive_mask)
+            neg_mask = ~torch.logical_xor(self.value < 0, ~self.positive_mask)
+            self.value = self.value * torch.logical_or(pos_mask, neg_mask)
+            self.value[~pos_mask] = 0.0001
+            self.value[~neg_mask] = -0.0001
+
+        return_val = self.value * conn_spikes
+        if self.norm_frequency == "time step":
+            self.normalize(time_step_norm=True)
+
+        return return_val
+
+    def prime_feature(self, connection, device, **kwargs) -> None:
+        #### Initialize value ####
+        if self.value is None:
+            self.initialize_value = lambda: torch.rand(
+                connection.source.n, connection.target.n
+            )
+
+        super().prime_feature(
+            connection, device, enforce_polarity=self.enforce_polarity, **kwargs
+        )
+        if self.enforce_polarity:
+            self.positive_mask = ((self.value > 0).sum(1) / self.value.shape[1]) > 0.5
+            tmp = torch.zeros_like(self.value)
+            tmp[self.positive_mask, :] = 1
+            self.positive_mask = tmp.bool()
+
+    def normalize(self, time_step_norm=False) -> None:
+        # 'time_step_norm' will indicate if normalize is being called from compute()
+        # or from network.py (after a sample is completed)
+
+        if self.norm_frequency == "time step" and time_step_norm:
+            super().normalize()
+
+        if self.norm_frequency == "sample" and not time_step_norm:
+            super().normalize()
+
+
+class Bias(AbstractFeature):
+    def __init__(
+        self,
+        name: str,
+        value: Union[torch.Tensor, float, int] = None,
+        value_dtype: torch.dtype = torch.float32,
+        range: Optional[Sequence[float]] = None,
+        norm: Optional[Union[torch.Tensor, float, int]] = None,
+        sparse: Optional[bool] = False,
+        batch_size: int = 1,
+    ) -> None:
+        # language=rst
+        """
+        Adds scalars to signals
+        :param name: Name of the feature
+        :param value: Values to add to the signals
+        :param value_dtype: Data type for :code:`value` tensor
+        :param range: Range of acceptable values for the :code:`value` parameter
+        :param norm: Value which all values in :code:`value` will sum to. Normalization of values occurs after each sample
+            and after the value has been updated by the learning rule (if there is one)
+        :param sparse: Should :code:`value` parameter be sparse tensor or not
+        :param batch_size: Mini-batch size.
+        """
+
+        super().__init__(
+            name=name,
+            value=value,
+            value_dtype=value_dtype,
+            range=[-torch.inf, +torch.inf] if range is None else range,
+            norm=norm,
+            sparse=sparse,
+            batch_size=batch_size,
+        )
+
+    def reset_state_variables(self) -> None:
+        pass
+
+    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+        return conn_spikes + self.value
+
+    def prime_feature(self, connection, device, **kwargs) -> None:
+        #### Initialize value ####
+        if self.value is None:
+            self.initialize_value = lambda: torch.rand(
+                connection.source.n, connection.target.n
+            )
+
+        super().prime_feature(connection, device, **kwargs)
+
+
+class Intensity(AbstractFeature):
+    def __init__(
+        self,
+        name: str,
+        value: Union[torch.Tensor, float, int] = None,
+        value_dtype: torch.dtype = torch.float32,
+        range: Optional[Sequence[float]] = None,
+        sparse: Optional[bool] = False,
+        batch_size: int = 1,
+    ) -> None:
+        # language=rst
+        """
+        Adds scalars to signals
+        :param name: Name of the feature
+        :param value: Values to scale signals by
+        :param value_dtype: Data type for :code:`value` tensor
+        :param sparse: Should :code:`value` parameter be sparse tensor or not
+        :param batch_size: Mini-batch size.
+        """
+        super().__init__(
+            name=name,
+            value=value,
+            value_dtype=value_dtype,
+            range=range,
+            sparse=sparse,
+            batch_size=batch_size,
+        )
+
+    def reset_state_variables(self) -> None:
+        pass
+
+    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+        return conn_spikes * self.value
+
+    def prime_feature(self, connection, device, **kwargs) -> None:
+        #### Initialize value ####
+        if self.value is None:
+            self.initialize_value = lambda: torch.clamp(
+                torch.sign(
+                    torch.randint(-1, +2, (connection.source.n, connection.target.n))
+                ),
+                self.range[0],
+                self.range[1],
+            )
+
+        super().prime_feature(connection, device, **kwargs)
+
+
+class Degradation(AbstractFeature):
+    def __init__(
+        self,
+        name: str,
+        value: Union[torch.Tensor, float, int] = None,
+        value_dtype: torch.dtype = torch.float32,
+        degrade_function: callable = None,
+        parent_feature: Optional[AbstractFeature] = None,
+        sparse: Optional[bool] = False,
+        batch_size: int = 1,
+    ) -> None:
+        # language=rst
+        """
+        Degrades propagating spikes according to :code:`degrade_function`.
+        Note: If :code:`parent_feature` is provided, it will override :code:`value`.
+        :param name: Name of the feature
+        :param value: Value used to degrade feature
+        :param value_dtype: Data type for :code:`value` tensor
+        :param degrade_function: Callable function which takes a single argument (:code:`value`) and returns a tensor or
+        constant to be *subtracted* from the propagating spikes.
+        :param parent_feature: Parent feature with desired :code:`value` to inherit
+        :param sparse: Should :code:`value` parameter be sparse tensor or not
+        :param batch_size: Mini-batch size.
+        """
+
+        # Note: parent_feature will override value. See abstract constructor
+        super().__init__(
+            name=name,
+            value=value,
+            value_dtype=value_dtype,
+            parent_feature=parent_feature,
+            sparse=sparse,
+            batch_size=batch_size,
+        )
+
+        self.degrade_function = degrade_function
+
+    def reset_state_variables(self) -> None:
+        pass
+
+    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+        return conn_spikes - self.degrade_function(self.value)
+
+
+class AdaptationBaseSynapsHistory(AbstractFeature):
+    def __init__(
+        self,
+        name: str,
+        value: Union[torch.Tensor, float, int] = None,
+        value_dtype: torch.dtype = torch.float32,
+        ann_values: Union[list, tuple] = None,
+        const_update_rate: float = 0.1,
+        const_decay: float = 0.001,
+        sparse: Optional[bool] = False,
+        batch_size: int = 1,
+    ) -> None:
+        # language=rst
+        """
+        The ANN will be use on each synaps to messure the previous activity of the neuron and descide to close or open connection.
+
+        :param name: Name of the feature
+        :param ann_values: Values to be use to build an ANN that will adapt the connectivity of the layer.
+        :param value: Values to be use to build an initial mask for the synapses.
+        :param const_update_rate: The mask upatate rate of the ANN decision.
+        :param const_decay: The spontaneous activation of the synapses.
+        :param sparse: Should :code:`value` parameter be sparse tensor or not
+        :param batch_size: Mini-batch size.
+        """
+
+        self.value_dtype = value_dtype
+        value = value.to(self.value_dtype)
+
+        # Define the ANN
+        class ANN(nn.Module):
+            def __init__(self, input_size, hidden_size, output_size):
+                super(ANN, self).__init__()
+                self.fc1 = nn.Linear(input_size, hidden_size, bias=False)
+                self.fc2 = nn.Linear(hidden_size, output_size, bias=False)
+
+            def forward(self, x):
+                x = torch.relu(self.fc1(x))
+                x = torch.tanh(self.fc2(x))  # MUST HAVE output between -1 and 1
+                return x
+
+        self.init_value = value.clone().detach()  # initial mask
+        self.mask = value  # final decision of the ANN
+        value = torch.zeros_like(value)  # initial mask
+        self.ann = ANN(ann_values[0].shape[0], ann_values[0].shape[1], 1)
+
+        # load weights from ann_values
+        with torch.no_grad():
+            self.ann.fc1.weight.data = ann_values[0]
+            self.ann.fc2.weight.data = ann_values[1]
+        self.ann.to(ann_values[0].device)
+
+        self.spike_buffer = torch.zeros(
+            (value.numel(), ann_values[0].shape[1]),
+            device=ann_values[0].device,
+            dtype=torch.bool,
+        )
+        self.counter = 0
+        self.start_counter = False
+        self.const_update_rate = const_update_rate
+        self.const_decay = const_decay
+
+        super().__init__(
+            name=name,
+            value=value,
+            value_dtype=self.value_dtype,
+            sparse=sparse,
+            batch_size=batch_size,
+        )
+
+    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+
+        # Update the spike buffer
+        if self.start_counter == False or conn_spikes.sum() > 0:
+            self.start_counter = True
+            if self.sparse:
+                flat_conn_spikes = conn_spikes.to_dense().flatten()
+            else:
+                flat_conn_spikes = conn_spikes.flatten()
+            self.spike_buffer[:, self.counter % self.spike_buffer.shape[1]] = (
+                flat_conn_spikes
+            )
+            self.counter += 1
+
+        # Update the masks
+        if self.counter % self.spike_buffer.shape[1] == 0:
+            with torch.no_grad():
+                ann_decision = self.ann(self.spike_buffer.to(self.value_dtype))
+            self.mask += (
+                ann_decision.view(self.mask.shape) * self.const_update_rate
+            )  # update mask with learning rate fraction
+            self.mask += self.const_decay  # spontaneous activate synapses
+            self.mask = torch.clamp(self.mask, -1, 1)  # cap the mask
+
+            # self.mask = torch.clamp(self.mask, -1, 1)
+            self.value = (self.mask > 0).to(self.value_dtype)
+            if self.sparse:
+                self.value = self.value.to_sparse()
+
+        return conn_spikes * self.value
+
+    def reset_state_variables(
+        self,
+    ):
+        self.spike_buffer = torch.zeros_like(self.spike_buffer)
+        self.counter = 0
+        self.start_counter = False
+        self.value = self.init_value.clone().detach()  # initial mask
+        pass
+
+
+class AdaptationBaseOtherSynaps(AbstractFeature):
+    def __init__(
+        self,
+        name: str,
+        value: Union[torch.Tensor, float, int] = None,
+        value_dtype: torch.dtype = torch.float32,
+        ann_values: Union[list, tuple] = None,
+        const_update_rate: float = 0.1,
+        const_decay: float = 0.01,
+        sparse: Optional[bool] = False,
+        batch_size: int = 1,
+    ) -> None:
+        # language=rst
+        """
+        The ANN will be use on each synaps to messure the previous activity of the neuron and descide to close or open connection.
+
+        :param name: Name of the feature
+        :param ann_values: Values to be use to build an ANN that will adapt the connectivity of the layer.
+        :param value: Values to be use to build an initial mask for the synapses.
+        :param value_dtype: Data type for :code:`value` tensor
+        :param const_update_rate: The mask upatate rate of the ANN decision.
+        :param const_decay: The spontaneous activation of the synapses.
+        :param sparse: Should :code:`value` parameter be sparse tensor or not
+        :param batch_size: Mini-batch size.
+        """
+        self.value_dtype = value_dtype
+        value = value.to(self.value_dtype)
+
+        # Define the ANN
+        class ANN(nn.Module):
+            def __init__(self, input_size, hidden_size, output_size):
+                super(ANN, self).__init__()
+                self.fc1 = nn.Linear(input_size, hidden_size, bias=False)
+                self.fc2 = nn.Linear(hidden_size, output_size, bias=False)
+
+            def forward(self, x):
+                x = torch.relu(self.fc1(x))
+                x = torch.tanh(self.fc2(x))  # MUST HAVE output between -1 and 1
+                return x
+
+        self.init_value = value.clone().detach()  # initial mask
+        self.mask = value  # final decision of the ANN
+        value = torch.zeros_like(value)  # initial mask
+        self.ann = ANN(ann_values[0].shape[0], ann_values[0].shape[1], 1)
+
+        # load weights from ann_values
+        with torch.no_grad():
+            self.ann.fc1.weight.data = ann_values[0]
+            self.ann.fc2.weight.data = ann_values[1]
+        self.ann.to(ann_values[0].device)
+
+        self.spike_buffer = torch.zeros(
+            (value.numel(), ann_values[0].shape[1]),
+            device=ann_values[0].device,
+            dtype=torch.bool,
+        )
+        self.counter = 0
+        self.start_counter = False
+        self.const_update_rate = const_update_rate
+        self.const_decay = const_decay
+
+        super().__init__(
+            name=name,
+            value=value,
+            value_dtype=self.value_dtype,
+            sparse=sparse,
+            batch_size=batch_size,
+        )
+
+    def compute(self, conn_spikes) -> Union[torch.Tensor, float, int]:
+
+        # Update the spike buffer
+        if self.start_counter == False or conn_spikes.sum() > 0:
+            self.start_counter = True
+            if self.sparse:
+                flat_conn_spikes = conn_spikes.to_dense().flatten()
+            else:
+                flat_conn_spikes = conn_spikes.flatten()
+            self.spike_buffer[:, self.counter % self.spike_buffer.shape[1]] = (
+                flat_conn_spikes
+            )
+            self.counter += 1
+
+        # Update the masks
+        if self.counter % self.spike_buffer.shape[1] == 0:
+            with torch.no_grad():
+                ann_decision = self.ann(self.spike_buffer.to(self.value_dtype))
+            self.mask += (
+                ann_decision.view(self.mask.shape) * self.const_update_rate
+            )  # update mask with learning rate fraction
+            self.mask += self.const_decay  # spontaneous activate synapses
+            self.mask = torch.clamp(self.mask, -1, 1)  # cap the mask
+
+            # self.mask = torch.clamp(self.mask, -1, 1)
+            self.value = (self.mask > 0).to(self.value_dtype)
+            if self.sparse:
+                self.value = self.value.to_sparse()
+
+        return conn_spikes * self.value
+
+    def reset_state_variables(
+        self,
+    ):
+        self.spike_buffer = torch.zeros_like(self.spike_buffer)
+        self.counter = 0
+        self.start_counter = False
+        self.value = self.init_value.clone().detach()  # initial mask
+        pass
+
+
+### Sub Features ###
+
+
+class AbstractSubFeature(ABC):
+    # language=rst
+    """
+    A way to inject a features methods (like normalization, learning, etc.) into the pipeline for user controlled
+    execution.
+    """
+
+    @abstractmethod
+    def __init__(
+        self,
+        name: str,
+        parent_feature: AbstractFeature,
+    ) -> None:
+        # language=rst
+        """
+        Instantiates a :code:`Augment` object. Will assign all incoming arguments as class variables.
+        :param name: Name of the augment
+        :param parent_feature: Primary feature which the augment will modify
+        """
+
+        self.name = name
+        self.parent = parent_feature
+        self.sub_feature = None  # <-- Defined in non-abstract constructor
+
+    def compute(self, _) -> None:
+        # language=rst
+        """
+        Proxy function to catch a pipeline execution from topology.py's :code:`compute` function. Allows :code:`SubFeature`
+        objects to be executed like real features in the pipeline.
+        """
+
+        # sub_feature should be defined in the non-abstract constructor
+        self.sub_feature()
+
+
+class Normalization(AbstractSubFeature):
+    # language=rst
+    """
+    Normalize parent features values so each target neuron has sum of feature values equal to a desired value :code:`norm`.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        parent_feature: AbstractFeature,
+    ) -> None:
+        super().__init__(name, parent_feature)
+
+        self.sub_feature = self.parent.normalize
+
+
+class Updating(AbstractSubFeature):
+    # language=rst
+    """
+    Update parent features values using the assigned update rule.
+    """
+
+    def __init__(
+        self,
+        name: str,
+        parent_feature: AbstractFeature,
+    ) -> None:
+        super().__init__(name, parent_feature)
+
+        self.sub_feature = self.parent.update

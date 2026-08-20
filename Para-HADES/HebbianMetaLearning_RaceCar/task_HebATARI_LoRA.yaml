@@ -1,0 +1,262 @@
+param:
+  # -----------------------------------------------------------------------
+  # Hebbian LoRA parameterization:
+  #   For each family f ∈ {A, B, C, D, lr} and each FC layer l:
+  #       W_f,l = beta_f * W0_f,l + U_f,l @ V_f,l
+  #
+  #   - W0 is frozen, deterministic random (generated from main.HebLoRA.w0_seed)
+  #   - sigma(W0) = 1/sqrt(d_in)
+  #   - beta_f is evolved scalar (shared across all layers/synapses of family f)
+  #   - LoRA rank defaults to 8 and is read from main.HebLoRA.rank
+  # -----------------------------------------------------------------------
+
+  beta_A:
+    type: float
+    array: [1]
+    name: beta_A
+    round: 5
+    min: -10.0
+    max: 10.0
+    default:
+    coevo_group: _default
+
+  beta_B:
+    type: float
+    array: [1]
+    name: beta_B
+    round: 5
+    min: -10.0
+    max: 10.0
+    default:
+    coevo_group: _default
+
+  beta_C:
+    type: float
+    array: [1]
+    name: beta_C
+    round: 5
+    min: -10.0
+    max: 10.0
+    default:
+    coevo_group: _default
+
+  beta_D:
+    type: float
+    array: [1]
+    name: beta_D
+    round: 5
+    min: -10.0
+    max: 10.0
+    default:
+    coevo_group: _default
+
+  beta_lr:
+    type: float
+    array: [1]
+    name: beta_lr
+    round: 5
+    min: -1.0
+    max: 1.0
+    default:
+    coevo_group: _default
+
+  # -------- Layer shapes --------
+  # l1: (648,128), l2: (128,64), l3: (64,3), rank=8
+  # U dims: (d_in, rank)  -> flattened
+  # V dims: (rank, d_out) -> flattened
+
+  A_l1_u: {type: float, array: [5184], name: A_l1_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: A_l1}
+  A_l1_v: {type: float, array: [1024], name: A_l1_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: A_l1}
+  A_l2_u: {type: float, array: [1024], name: A_l2_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: A_l2}
+  A_l2_v: {type: float, array: [512],  name: A_l2_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: A_l2}
+  A_l3_u: {type: float, array: [512],  name: A_l3_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: A_l3}
+  A_l3_v: {type: float, array: [24],   name: A_l3_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: A_l3}
+
+  B_l1_u: {type: float, array: [5184], name: B_l1_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: B_l1}
+  B_l1_v: {type: float, array: [1024], name: B_l1_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: B_l1}
+  B_l2_u: {type: float, array: [1024], name: B_l2_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: B_l2}
+  B_l2_v: {type: float, array: [512],  name: B_l2_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: B_l2}
+  B_l3_u: {type: float, array: [512],  name: B_l3_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: B_l3}
+  B_l3_v: {type: float, array: [24],   name: B_l3_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: B_l3}
+
+  C_l1_u: {type: float, array: [5184], name: C_l1_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: C_l1}
+  C_l1_v: {type: float, array: [1024], name: C_l1_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: C_l1}
+  C_l2_u: {type: float, array: [1024], name: C_l2_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: C_l2}
+  C_l2_v: {type: float, array: [512],  name: C_l2_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: C_l2}
+  C_l3_u: {type: float, array: [512],  name: C_l3_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: C_l3}
+  C_l3_v: {type: float, array: [24],   name: C_l3_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: C_l3}
+
+  D_l1_u: {type: float, array: [5184], name: D_l1_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: D_l1}
+  D_l1_v: {type: float, array: [1024], name: D_l1_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: D_l1}
+  D_l2_u: {type: float, array: [1024], name: D_l2_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: D_l2}
+  D_l2_v: {type: float, array: [512],  name: D_l2_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: D_l2}
+  D_l3_u: {type: float, array: [512],  name: D_l3_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: D_l3}
+  D_l3_v: {type: float, array: [24],   name: D_l3_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: D_l3}
+
+  lr_l1_u: {type: float, array: [5184], name: lr_l1_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: lr_l1}
+  lr_l1_v: {type: float, array: [1024], name: lr_l1_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: lr_l1}
+  lr_l2_u: {type: float, array: [1024], name: lr_l2_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: lr_l2}
+  lr_l2_v: {type: float, array: [512],  name: lr_l2_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: lr_l2}
+  lr_l3_u: {type: float, array: [512],  name: lr_l3_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: lr_l3}
+  lr_l3_v: {type: float, array: [24],   name: lr_l3_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: lr_l3}
+
+  cnn:
+    type: float
+    array: [1362]       # conv1: 6x3x3x3=162, conv2: 8x6x5x5=1200 (flat, in order)
+    name: cnn
+    round: 4
+    min: -0.5
+    max: 0.5            # narrower CNN init range to reduce immediate policy saturation
+    default:
+    coevo_group: cnn
+
+main:
+  HebLoRA:
+    rank: 8
+    w0_seed: 12345
+
+  HebEval:
+    eval_episodes: 3
+    seed_base: 12345
+    render: False
+
+  Task_resource:
+    type: CPU
+    gpu: 0
+    cpu: 2
+    # theadsPerCore: 2
+    memory: '32GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: '' # 's1cmp010,s1cmp011,s1cmp013,s1cmp015,d1cmp007'
+    path: '/logs_Task'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/Heb.sif'
+
+
+  Main_resource:
+    type: CPU
+    gpu: 0
+    cpu: 10
+    # theadsPerCore: 2
+    memory: '128GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: '' # 's1cmp010,s1cmp011,s1cmp013,s1cmp015,d1cmp007'
+    path: '/logs_Agent'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'
+
+
+ML:
+    RevFF_predictor:
+        top_k_percentile: 20
+        #ANN_Layers_size: None
+        dropout_rate: 0.2
+        epochs: 300
+        batch_size: 16
+        learning_rate: 0.001
+        early_stop_threshold: 0.05
+
+        min_epochs_before_early_stop: 10
+        allowed_architectures: ['ANN']
+        max_models_to_train: 1
+        validation: False
+        validation_split: 0.2
+        # gradient_clip: None
+        buffer_multiplier: 2
+        use_log_scaler: False
+
+    CMA_ES:
+        scaler_type: rank
+        use_smoothing: True
+        diag_mode: auto
+        diag_mode_threshold: 4096
+        max_full_cov_gib: 32.0
+       
+        
+    GA:
+        mutation_rate: 0.1
+        sigma: 0.1
+        crossover_prob: 0.5
+        scaler_type: rank
+        
+    SNES:
+        scaler_type: rank
+        lr_mu: 1.0
+        lr_sigma: 1.0
+        
+    DiffusionEvo:
+        # ========== ALGORITHM SELECTION ==========
+        algorithm: conditional    # Options: "conditional" or "unconditional"
+        
+        # ========== SHARED PARAMETERS (both algorithms) ==========
+        use_log_scaler: True      # Use log scaler for fitness (vs rank scaler)
+        top_k_percentile: 20      # Top % of genes to load for learning
+        
+        # ========== UNCONDITIONAL PARAMETERS (algorithm=unconditional) ==========
+        # Evolutionary diffusion without training
+        num_steps: 100             # Denoising steps (T)
+        noise_scale: 0.5          # Mutation magnitude σ_m ∈ [0, 1]
+        latent_dim: auto          # Latent projection dim (auto, or int)
+        alpha_schedule: cosine    # Schedule type (cosine, linear, ddpm)
+        pool_size: auto           # Max population size (auto, or int)
+        min_datapoints: None      # Min genes to load before starting
+        
+        # ========== CONDITIONAL PARAMETERS (algorithm=conditional) ==========
+        # Neural network trained on historical data
+        hidden_dims: None         # Network layers (auto-sized if None)
+        diffusion_steps: 100      # Training diffusion steps
+        learning_rate: 0.001
+        weight_decay: 0.00001
+        batch_size: 32
+        max_epochs: 777
+        conditions: [fitness]     # Conditioning information
+        custom_conditions: {}
+        exploration_mode: adaptive   # adaptive, random, greedy
+        exploration_noise: 0.1
+        mutation_rate: 0.1
+        use_model_cache: True
+        force_retrain: False
+        validation_split: 0.1
+        
+        # ========== FINE-TUNING CONTROLS ==========
+        use_finetuning: True
+        finetune_lr_scale: 0.5
+        finetune_epoch_scale: 0.5
+        finetune_min_epochs: 150
+        finetune_every_n_gens: 1
+        finetune_decay: 0.95
+        checkpoint_dir: running
+    
+    HADES:
+        # Gemini conditional diffusion parameters (GA_class_CondEvo_Gemini.py)
+        hidden_dims: 512             # Network hidden dim (int for Gemini)
+        diffusion_steps: 1000
+        learning_rate: 0.00001
+        weight_decay: 0.0001
+        batch_size: 64
+        max_epochs: 10
+        layers: 6
+        dropout: 0.1
+        inference_steps: 50
+        guidance_scale: 4.0
+        fitness_embedding_scale: 1.0
+        top_k_percentile: 20
+        
+        # Fine-tuning controls
+        use_finetuning: True
+        finetune_lr_scale: 0.5
+        finetune_epoch_scale: 0.5
+        finetune_min_epochs: 10
+        finetune_every_n_gens: 1
+        finetune_decay: 0.95
+        checkpoint_dir: running
+
+founder:
+  # When saveFounder() saves a new best gene, it will also call the function
+  # below to reconstruct the full Hebbian + CNN parameter payload and write
+  # a companion .pt file.
+    full_params_fn:
+        module: HebbianMetaLearning.task_HebATARI_LoRA
+        function: reconstruct_full_hebb_params

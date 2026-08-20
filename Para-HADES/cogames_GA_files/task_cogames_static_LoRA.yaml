@@ -1,0 +1,170 @@
+param:
+  # -----------------------------------------------------------------------
+  # Static LoRA MLP — low-rank factorised static weights, no plasticity.
+  #   W_l = beta_l * W0_l + U_l @ V_l   (W0 frozen, deterministic)
+  # Layer shapes with stacked_grid obs (input_dim=1732, rank=8):
+  #   l1: (1732,64)  U:(1732,8)=13856 V:(8,64)=512
+  #   l2: (64,32)    U:(64,8)=512     V:(8,32)=256
+  #   l3: (32,5)     U:(32,8)=256     V:(8,5)=40
+  # Total evolved params = 3 betas + 14368 + 768 + 296 = 15,435
+  # -----------------------------------------------------------------------
+
+  beta_l1: {type: float, array: [1], name: beta_l1, round: 5, min: -3.0, max: 3.0, default: , coevo_group: beta_l1}
+  beta_l2: {type: float, array: [1], name: beta_l2, round: 5, min: -3.0, max: 3.0, default: , coevo_group: beta_l2}
+  beta_l3: {type: float, array: [1], name: beta_l3, round: 5, min: -3.0, max: 3.0, default: , coevo_group: beta_l3}
+
+  W_l1_u: {type: float, array: [13856], name: W_l1_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: W_l1}
+  W_l1_v: {type: float, array: [512],   name: W_l1_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: W_l1}
+  W_l2_u: {type: float, array: [512],   name: W_l2_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: W_l2}
+  W_l2_v: {type: float, array: [256],   name: W_l2_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: W_l2}
+  W_l3_u: {type: float, array: [256],   name: W_l3_u, round: 5, min: -0.2, max: 0.2, default: , coevo_group: W_l3}
+  W_l3_v: {type: float, array: [40],    name: W_l3_v, round: 5, min: -0.2, max: 0.2, default: , coevo_group: W_l3}
+
+main:
+  StaticLoRA:
+    rank: 8
+    w0_seed: 12345
+
+  StaticEval:
+    # CUTOVER 2026-05-08: unified onto arena + composite_v5_role_event so all
+    # 7 task variants are comparable (was: tutorial.scout / 1 agent / 7 eps /
+    # composite_exploration_v2). Obs shape (300,3) matches across both
+    # missions, so existing LoRA gene shapes still load.
+    mission: arena
+    num_agents: 4
+    fitness_stat: composite_v5_role_event
+    eval_episodes: 40
+    seed_base: 12345
+    render: False
+    hidden: [64, 32]
+    # Frame-stacked dense-grid observation (see evaluate_static_cogames.py)
+    obs_mode: stacked_grid
+    frame_stack: 4
+    grid_h: 11
+    grid_w: 11
+    num_channels: 3
+    global_state_dim: 70
+    fitness_v5:
+      w_F_heart:        5.0
+      w_F_chest:        5.0
+      w_F_ep:           3.0
+      w_B_ach_ore:      0.3
+      w_B_ach_gear:     0.5
+      w_B_role_events:  0.2
+      w_B_explore:      0.4
+      # w_B_init=0 under reduction='max' (see task_cogames_static.yaml).
+      w_B_init:         0.0
+      score_B_cap:      3.0
+      reduction:        max
+
+  Task_resource:
+    type: CPU
+    gpu: 0
+    cpu: 2
+    memory: '32GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Task'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/mettagrid.sif'
+
+  Main_resource:
+    type: CPU
+    gpu: 0
+    cpu: 10
+    memory: '128GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Agent'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'
+
+
+ML:
+    RevFF_predictor:
+        use_log_scaler: False
+        top_k_percentile: 20
+        dropout_rate: 0.2
+        epochs: 300
+        batch_size: 16
+        learning_rate: 0.001
+        early_stop_threshold: 0.05
+        min_epochs_before_early_stop: 10
+        allowed_architectures: ['ANN']
+        max_models_to_train: 1
+        validation: False
+        validation_split: 0.2
+        buffer_multiplier: 2
+
+    CMA_ES:
+        scaler_type: rank
+        use_smoothing: True
+        diag_mode: auto
+        diag_mode_threshold: 4096
+        max_full_cov_gib: 32.0
+
+    GA:
+        mutation_rate: 0.1
+        sigma: 0.1
+        crossover_prob: 0.5
+        scaler_type: rank
+
+    SNES:
+        scaler_type: rank
+        lr_mu: 1.0
+        lr_sigma: 1.0
+
+    DiffusionEvo:
+        algorithm: conditional
+        use_log_scaler: True
+        top_k_percentile: 20
+        num_steps: 100
+        noise_scale: 0.5
+        latent_dim: auto
+        alpha_schedule: cosine
+        pool_size: auto
+        min_datapoints: None
+        hidden_dims: None
+        diffusion_steps: 100
+        learning_rate: 0.001
+        weight_decay: 0.00001
+        batch_size: 32
+        max_epochs: 777
+        conditions: [fitness]
+        custom_conditions: {}
+        exploration_mode: adaptive
+        exploration_noise: 0.1
+        mutation_rate: 0.1
+        use_model_cache: True
+        force_retrain: False
+        validation_split: 0.1
+        use_finetuning: True
+        finetune_lr_scale: 0.5
+        finetune_epoch_scale: 0.5
+        finetune_min_epochs: 150
+        finetune_every_n_gens: 1
+        finetune_decay: 0.95
+        checkpoint_dir: running
+
+    HADES:
+        hidden_dims: 512
+        diffusion_steps: 1000
+        learning_rate: 0.00001
+        weight_decay: 0.0001
+        batch_size: 64
+        max_epochs: 10
+        layers: 6
+        dropout: 0.1
+        inference_steps: 50
+        guidance_scale: 4.0
+        fitness_embedding_scale: 1.0
+        top_k_percentile: 20
+        use_finetuning: True
+        finetune_lr_scale: 0.5
+        finetune_epoch_scale: 0.5
+        finetune_min_epochs: 10
+        finetune_every_n_gens: 1
+        finetune_decay: 0.95
+        checkpoint_dir: running

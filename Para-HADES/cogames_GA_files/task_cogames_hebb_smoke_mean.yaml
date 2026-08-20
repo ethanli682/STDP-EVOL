@@ -1,0 +1,109 @@
+param:
+  A:
+    type: float
+    array: [59808]
+    name: A
+    round: 4
+    min: -10.0
+    max:  10.0
+    default:
+    coevo_group: A
+
+  B:
+    type: float
+    array: [59808]
+    name: B
+    round: 4
+    min: -10.0
+    max:  10.0
+    default:
+    coevo_group: B
+
+  C:
+    type: float
+    array: [59808]
+    name: C
+    round: 4
+    min: -10.0
+    max:  10.0
+    default:
+    coevo_group: C
+
+  D:
+    type: float
+    array: [59808]
+    name: D
+    round: 4
+    min: -10.0
+    max:  10.0
+    default:
+    coevo_group: D
+
+  lr:
+    type: float
+    array: [59808]
+    name: lr
+    round: 5
+    min: -1
+    max: 1
+    default:
+    coevo_group: lr
+
+main:
+  HebEval:
+    # SMOKE config (2026-05-08): identical to hebb_smoke.yaml but with
+    # reduction=mean and w_B_init=0.5 to test team-coordination signal.
+    mission: arena
+    num_agents: 4
+    fitness_stat: composite_v5_role_event
+    eval_episodes: 5
+    seed_base: 12345
+    render: False
+    init_weights: ka_uni
+    fitness_v5:
+      w_F_heart:        5.0
+      w_F_chest:        5.0
+      w_F_ep:           3.0
+      w_B_ach_ore:      0.3
+      w_B_ach_gear:     0.5
+      w_B_role_events:  0.2
+      w_B_explore:      0.4
+      w_B_init:         0.5      # mean reduction → init_loc carries weight
+      score_B_cap:      3.0
+      reduction:        mean
+
+  Task_resource:
+    type: CPU
+    gpu: 0
+    cpu: 2
+    memory: '32GB'
+    time: '00-04:00:00'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Task'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/mettagrid.sif'
+
+  Main_resource:
+    type: CPU
+    gpu: 0
+    cpu: 4
+    memory: '64GB'
+    time: '00-04:00:00'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Agent'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'
+
+
+ML:
+    CMA_ES:
+        scaler_type: rank
+        use_smoothing: True
+        diag_mode: auto
+        diag_mode_threshold: 4096
+        max_full_cov_gib: 32.0
+        sigma_boost_factor: 1.0
+        sigma_max_restart: 1.5
+        initial_sigma: 0.1

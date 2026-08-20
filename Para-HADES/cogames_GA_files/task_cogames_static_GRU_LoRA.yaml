@@ -1,0 +1,197 @@
+param:
+  # -----------------------------------------------------------------------
+  # Static GRU LoRA — low-rank input projection, dense recurrent/output.
+  #   W_in  = beta_in * W0_in + U_in @ V_in    (W0 frozen, rank=8)
+  #   W_ih, W_hh, W_out: dense (not factorised; already small)
+  #
+  # Param budget with stacked_grid obs (input_dim=1732, proj=64, hidden=32, rank=8):
+  #   beta_in:     1
+  #   W_in_u:  13856  (1732 * 8)
+  #   W_in_v:    512  (   8 * 64)
+  #   W_ih:     6144  (  96 * 64)
+  #   W_hh:     3072  (  96 * 32)
+  #   W_out:     160  (   5 * 32)
+  #   TOTAL  = 23,745
+  # -----------------------------------------------------------------------
+
+  beta_in: {type: float, array: [1],     name: beta_in, round: 5, min: -3.0, max: 3.0, default: , coevo_group: beta_in}
+  W_in_u:  {type: float, array: [13856], name: W_in_u,  round: 5, min: -0.2, max: 0.2, default: , coevo_group: W_in}
+  W_in_v:  {type: float, array: [512],   name: W_in_v,  round: 5, min: -0.2, max: 0.2, default: , coevo_group: W_in}
+
+  W_ih:
+    type: float
+    array: [6144]
+    name: W_ih
+    round: 4
+    min: -3.0
+    max:  3.0
+    default:
+    coevo_group: W_ih
+
+  W_hh:
+    type: float
+    array: [3072]
+    name: W_hh
+    round: 4
+    min: -3.0
+    max:  3.0
+    default:
+    coevo_group: W_hh
+
+  W_out:
+    type: float
+    array: [160]
+    name: W_out
+    round: 4
+    min: -3.0
+    max:  3.0
+    default:
+    coevo_group: W_out
+
+main:
+  StaticLoRA:
+    rank: 8
+    w0_seed: 12345
+
+  StaticEval:
+    # CUTOVER 2026-05-08: unified onto arena + composite_v5_role_event so all
+    # 7 task variants are comparable.
+    mission: arena
+    num_agents: 4
+    fitness_stat: composite_v5_role_event
+    eval_episodes: 40
+    seed_base: 12345
+    render: False
+    proj: 64
+    hidden: 32
+    # Frame-stacked dense-grid observation (see evaluate_static_GRU_cogames.py)
+    obs_mode: stacked_grid
+    frame_stack: 4
+    grid_h: 11
+    grid_w: 11
+    num_channels: 3
+    global_state_dim: 70
+    fitness_v5:
+      w_F_heart:        5.0
+      w_F_chest:        5.0
+      w_F_ep:           3.0
+      w_B_ach_ore:      0.3
+      w_B_ach_gear:     0.5
+      w_B_role_events:  0.2
+      w_B_explore:      0.4
+      # w_B_init=0 under reduction='max' (see task_cogames_static.yaml).
+      w_B_init:         0.0
+      score_B_cap:      3.0
+      reduction:        max
+
+  Task_resource:
+    type: CPU
+    gpu: 0
+    cpu: 2
+    memory: '32GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Task'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/mettagrid.sif'
+
+  Main_resource:
+    type: CPU
+    gpu: 0
+    cpu: 10
+    memory: '128GB'
+    time: '00-23:59:59'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Agent'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'
+
+
+ML:
+    RevFF_predictor:
+        use_log_scaler: False
+        top_k_percentile: 20
+        dropout_rate: 0.2
+        epochs: 300
+        batch_size: 16
+        learning_rate: 0.001
+        early_stop_threshold: 0.05
+        min_epochs_before_early_stop: 10
+        allowed_architectures: ['ANN']
+        max_models_to_train: 1
+        validation: False
+        validation_split: 0.2
+        buffer_multiplier: 2
+
+    CMA_ES:
+        scaler_type: rank
+        use_smoothing: True
+        diag_mode: auto
+        diag_mode_threshold: 4096
+        max_full_cov_gib: 32.0
+
+    GA:
+        mutation_rate: 0.1
+        sigma: 0.1
+        crossover_prob: 0.5
+        scaler_type: rank
+
+    SNES:
+        scaler_type: rank
+        lr_mu: 1.0
+        lr_sigma: 1.0
+
+    DiffusionEvo:
+        algorithm: conditional
+        use_log_scaler: True
+        top_k_percentile: 20
+        num_steps: 100
+        noise_scale: 0.5
+        latent_dim: auto
+        alpha_schedule: cosine
+        pool_size: auto
+        min_datapoints: None
+        hidden_dims: None
+        diffusion_steps: 100
+        learning_rate: 0.001
+        weight_decay: 0.00001
+        batch_size: 32
+        max_epochs: 777
+        conditions: [fitness]
+        custom_conditions: {}
+        exploration_mode: adaptive
+        exploration_noise: 0.1
+        mutation_rate: 0.1
+        use_model_cache: True
+        force_retrain: False
+        validation_split: 0.1
+        use_finetuning: True
+        finetune_lr_scale: 0.5
+        finetune_epoch_scale: 0.5
+        finetune_min_epochs: 150
+        finetune_every_n_gens: 1
+        finetune_decay: 0.95
+        checkpoint_dir: running
+
+    HADES:
+        hidden_dims: 512
+        diffusion_steps: 1000
+        learning_rate: 0.00001
+        weight_decay: 0.0001
+        batch_size: 64
+        max_epochs: 10
+        layers: 6
+        dropout: 0.1
+        inference_steps: 50
+        guidance_scale: 4.0
+        fitness_embedding_scale: 1.0
+        top_k_percentile: 20
+        use_finetuning: True
+        finetune_lr_scale: 0.5
+        finetune_epoch_scale: 0.5
+        finetune_min_epochs: 10
+        finetune_every_n_gens: 1
+        finetune_decay: 0.95
+        checkpoint_dir: running

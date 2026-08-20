@@ -1,0 +1,197 @@
+param:
+  # -----------------------------------------------------------------------
+  # Stage B: ABCD+η Hebbian coefficients for the DT Adapter module.
+  #
+  # The Adapter has two linear layers (fc1, fc2) each of size DIM×DIM=256×256.
+  # Total synapses = 2 × 256 × 256 = 131072 (fc1 first, then fc2).
+  # Gene = 5 coefficient arrays × 131072 = 655360 floats per candidate.
+  #
+  # Hebbian rule (ABCD_lr_D_in, same as standalone Hebbian MLP):
+  #   Δw_ij = lr_ij * (A_ij * o_i * o_j + B_ij * o_i + C_ij * o_j + D_ij)
+  # where o_i = pre-synaptic, o_j = post-synaptic activity.
+  #
+  # Adapter architecture (frozen DT is frozen; only fc1/fc2 weights are plastic):
+  #   fc1: Linear(256, 256)  -- plastic weights, bias frozen at 0
+  #   fc2: Linear(256, 256)  -- plastic weights, bias frozen at 0
+  #   norm: LayerNorm(256)   -- frozen (from DT checkpoint)
+  #   forward: out = norm(x + fc2(GELU(fc1(x))))  with residual
+  #
+  # Range notes (from Najarro & Risi 2007.02686):
+  #   A, B, C, D: ±10 (coefficient range); lr: ±1 (per-synapse learning rate)
+  #   Initial weights re-sampled U[-0.1, 0.1] per episode.
+  #   Flag F1: activation-scale mismatch vs. paper's quadruped/CarRacing tasks
+  #   is possible; retune init bounds and weight_clamp if weights diverge early.
+  # -----------------------------------------------------------------------
+
+  A:
+    type: float
+    array: [131072]     # one A coefficient per synapse (fc1 + fc2)
+    name: A
+    round: 4
+    min: -10.0
+    max:  10.0
+    default:
+    coevo_group: A
+
+  B:
+    type: float
+    array: [131072]
+    name: B
+    round: 4
+    min: -10.0
+    max:  10.0
+    default:
+    coevo_group: B
+
+  C:
+    type: float
+    array: [131072]
+    name: C
+    round: 4
+    min: -10.0
+    max:  10.0
+    default:
+    coevo_group: C
+
+  D:
+    type: float
+    array: [131072]
+    name: D
+    round: 4
+    min: -10.0
+    max:  10.0
+    default:
+    coevo_group: D
+
+  lr:
+    type: float
+    array: [131072]     # per-synapse learning rate
+    name: lr
+    round: 5
+    min: -1.0
+    max:  1.0
+    default:
+    coevo_group: lr
+
+main:
+  HebEval:
+    # Mission must match composite_v7 mechanics (miner role, haul round-trips).
+    # tutorial.scout places all 4 role objects below spawn — same as standalone
+    # Hebbian eval — so DT+Adapter and Hebbian MLP scores are directly comparable.
+    mission: tutorial.scout
+
+    # Number of agents. bottom2_mean reduction forces cooperation (same as Hebb).
+    num_agents: 4
+
+    # composite_v7_zstat: miner-gated mine-and-deposit fitness.
+    # Matches task_cogames_hebb.yaml so cross-variant comparison is valid.
+    fitness_stat: composite_v7_zstat
+
+    # Fewer episodes than standalone Hebbian (40) because the DT body is heavier.
+    # Each episode ~ 1-3 min on CPU depending on hardware. Increase once timing
+    # is profiled on the cluster; keep eval_episodes ≥ 10 for stable fitness.
+    eval_episodes: 10
+
+    seed_base: 12345     # per-epoch offset added automatically (+epoch * 999983)
+    render: False
+
+    # RTG held constant at 1.0 (normalized) throughout every episode.
+    # Stage B decision #6: RTG is a fixed rollout config, not part of the ES vector.
+    target_rtg: 1.0
+
+    # Weight clamp on the plastic Adapter weights during an episode.
+    # Flag F2: paper used unbounded weights for Ant, [-1,1] clamp for CarRacing.
+    # Our case (high-dim transformer activations) leans toward clamping.
+    weight_clamp: 3.0
+
+    # Adapter hidden dimension (must match the DT checkpoint's state_dim).
+    adapter_dim: 256
+
+    # Path to the trained DT checkpoint (set before launching ES).
+    # REQUIRED: leave empty to get a hard error at eval time rather than
+    # a silent fallback.
+    dt_checkpoint_path: ''    # e.g. /cluster/.../ckpt_step_200000.pt
+
+    # v7 fitness weights (same as task_cogames_hebb.yaml for comparability).
+    fitness_v7:
+      w_role:           1.0
+      w_wrong:          5.0
+      w_touch:          1.0
+      w_explore:        2.0
+      w_mine:          15.0
+      w_deposit:       20.0
+      w_hold:           1.0
+      w_idle:           1.0
+      reduction:        bottom2_mean
+
+
+  Task_resource:
+    type: CPU
+    gpu: 0
+    cpu: 2
+    memory: '32GB'
+    time: '01-00:00:00'      # 24h — DT eval is heavier than standalone Hebbian
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Task'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/mettagrid.sif'
+
+  Main_resource:
+    type: CPU
+    gpu: 0
+    cpu: 10
+    memory: '128GB'
+    time: '01-00:00:00'
+    conda_env: 'delayW'
+    partition: 'preempt'
+    exclude_nodes: ''
+    path: '/logs_Agent'
+    singularity_image: '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'
+
+
+ML:
+  CMA_ES:
+    scaler_type: rank
+    use_smoothing: True
+    # Diagonal CMA-ES is mandatory for gene dim 655360 (auto switches above 4096).
+    diag_mode: auto
+    diag_mode_threshold: 4096
+    max_full_cov_gib: 32.0
+    # Start small: high sigma can push adapter weights into saturation given the
+    # transformer activation scale (Flag F1). Retune if stuck.
+    sigma_boost_factor: 1.0
+    sigma_max_restart: 1.5
+    initial_sigma: 0.05      # smaller than standalone Hebbian (0.1) — flag F1 caution
+
+  HADES:
+    hidden_dims: 512
+    diffusion_steps: 1000
+    learning_rate: 0.00001
+    weight_decay: 0.0001
+    batch_size: 64
+    max_epochs: 10
+    layers: 6
+    dropout: 0.1
+    inference_steps: 50
+    guidance_scale: 4.0
+    fitness_embedding_scale: 1.0
+    top_k_percentile: 20
+    use_finetuning: True
+    finetune_lr_scale: 0.5
+    finetune_epoch_scale: 0.5
+    finetune_min_epochs: 10
+    finetune_every_n_gens: 1
+    finetune_decay: 0.95
+    checkpoint_dir: running
+
+  GA:
+    mutation_rate: 0.1
+    sigma: 1.0
+    crossover_prob: 0.5
+    scaler_type: rank
+
+  SNES:
+    scaler_type: rank
+    lr_mu: 1.0
+    lr_sigma: 1.0

@@ -1,0 +1,84 @@
+[tool.poetry]
+name = "bindsnet"
+version = "0.3.4"
+description = "Spiking neural networks for ML in Python"
+authors = [ "Hananel Hazan <hananel@hazan.org.il>", "Daniel Saunders", "Darpan Sanghavi", "Hassaan Khan" ]
+license = "AGPL-3.0-only"
+readme = "README.md"
+repository = "https://github.com/BindsNET/bindsnet"
+documentation = "https://bindsnet-docs.readthedocs.io/"
+keywords = ["spiking", "neural", "networks", "pytorch"]
+
+[tool.poetry.dependencies]
+python = ">=3.11,<3.14"
+numpy = "^2"
+numba = "^0"
+scipy = "^1"
+Cython = "^3"
+torch = [
+    {version = "2.11.0", markers = "sys_platform != 'darwin'", source = "torch+cu128"},
+    {version = "2.11.0", markers = "sys_platform == 'darwin'" },
+]
+torchvision = [
+    {version = "0.26.0", markers = "sys_platform != 'darwin'", source = "torch+cu128"},
+    {version = "0.26.0", markers = "sys_platform == 'darwin'" },
+]
+torchaudio = [
+    {version = "2.11.0", markers = "sys_platform != 'darwin'", source = "torch+cu128"},
+    {version = "2.11.0", markers = "sys_platform == 'darwin'" },
+]
+tensorboardX = "^2.6.4"
+tqdm = "^4"
+matplotlib = "^3"
+ale-py = "^0"
+gymnasium = {extras = ["atari"], version = "^1"}
+scikit-build = "^0"
+scikit-image = "^0"
+scikit-learn = "^1"
+opencv-python = "^4"
+pandas = "^3"
+foolbox = "^3"
+
+[[tool.poetry.source]]
+ name = "torch+cu128"
+ url = "https://download.pytorch.org/whl/cu128"
+ priority = "explicit"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9"
+pre-commit = "^4"
+notebook = "^7"
+jupyterlab = "^4"
+isort = "^7"
+black = "^26"
+autoflake = "^2"
+
+[build-system]
+requires = ["setuptools", "poetry-core>=1.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.isort]
+profile = "black"
+line_length = 88
+src_paths = ["bindsnet", "test"]
+
+[tool.black]
+target-version = ['py38']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.pytest_cache
+  | \.venv
+  | \.github
+  | build
+  | dist
+  | BindsNET.egg-info
+  | notebooks
+  | data
+  | logs
+  )/
+'''
