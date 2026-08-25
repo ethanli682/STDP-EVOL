@@ -17,6 +17,31 @@ Mapping from the paper to this task
 Rate convention: the paper's "8 Hz" over a 1000 ms decision window means 8 spikes
 per decision. This script matches SPIKES PER DECISION, not Hz, so gc_max_rate
 defaults to 80 Hz over the 100 ms granularity window.
+
+Tuning the AC layer
+-------------------
+Only two knobs set AC activity, and they fight each other:
+
+  --ac_gain   scales the frozen GC->AC feedforward weights (mV per presyn spike,
+              after 1/sqrt(fan-in) normalisation).
+  --rec_exc / --rec_inh
+              TOTAL per-neuron recurrent budgets in mV -- the drive a cell would
+              get if every excitatory (resp. inhibitory) partner fired on one
+              timestep. Column-normalised, so they do NOT scale with --ac. This
+              matters: with the raw Mexican hat, every AC's inhibitory row summed
+              to about -790 mV at --ac 1000, roughly 300x the feedforward drive.
+              That is a negative-feedback loop stiff enough that --ac_gain has no
+              measurable effect -- exactly the failure mode of "keep raising
+              ac_gain and nothing happens".
+
+The AC LIF also has --ac_lbound. Recurrent inhibition here is subtractive and
+BindsNET does not floor the membrane voltage by default, so without it one
+synchronous burst drives v to -1000s of mV; since reset_state_variables() runs
+once per episode rather than once per decision, the layer then stays dead for the
+whole episode and the plastic AC->MC weights never move.
+
+Target operating point: ~10% of AC active per decision, coverage 1.00, nn_ratio
+well below 0.6. --diagnose prints all of these before training starts.
 """
 
 import matplotlib
@@ -72,7 +97,7 @@ parser.add_argument("--view_r", type=int, default=14)
 
 # rendering (now actually gated -- the old script captured every frame of every episode)
 parser.add_argument("--render_replays", type=bool, default=True)
-parser.add_argument("--render_every", type=int, default=25)
+parser.add_argument("--render_every", type=int, default=10)
 parser.add_argument("--replay_fps", type=int, default=20)
 parser.add_argument("--plot_every", type=int, default=50)
 
@@ -87,17 +112,27 @@ parser.add_argument("--gc_max_rate", type=float, default=80.0)     # 8 spikes / 
 # --- AC layer (paper: 2000 neurons, 12% GC->AC sparsity) ---
 parser.add_argument("--ac", type=int, default=1000)   # paper uses 2000; 1000 is faster
 parser.add_argument("--gc_ac_sparsity", type=float, default=0.12)
-parser.add_argument("--ac_gain", type=float, default=25.0)   # TUNE ME (see notes)
+parser.add_argument("--ac_gain", type=float, default=45.0)   # TUNE ME (see notes)
+parser.add_argument("--ac_lbound", type=float, default=-80.0)  # v floor; see notes
 parser.add_argument("--rec_mode", type=str, default="local",
                     choices=["none", "random", "local"])
-parser.add_argument("--rec_inh", type=float, default=1.2)
+# rec_exc / rec_inh are TOTAL per-neuron budgets in mV: the drive a neuron would
+# receive if every one of its excitatory (resp. inhibitory) presynaptic partners
+# fired on the same timestep. Column-normalised, so they do not scale with --ac.
+parser.add_argument("--rec_exc", type=float, default=15.0)
+parser.add_argument("--rec_inh", type=float, default=25.0)
 parser.add_argument("--rec_radius", type=float, default=4.0)
+parser.add_argument("--ac_target_sparsity", type=float, default=0.10)
 
 # --- MC layer (paper: 4 x 100 = 400) ---
 parser.add_argument("--mc_pop", type=int, default=80)
 parser.add_argument("--ac_mc_sparsity", type=float, default=0.40)
-parser.add_argument("--w_max", type=float, default=12.0)
-parser.add_argument("--nu", type=float, default=5e-2)
+parser.add_argument("--ac_mc_init", type=float, default=0.3)  # U(0, init) per synapse
+parser.add_argument("--w_max", type=float, default=1.0)
+# nu must be scaled with --w_max: MSTDPET updates once per SIMULATION step, i.e.
+# --granularity times per decision, so a large nu pins every weight at the cap
+# within one episode -- which looks exactly like "weights not changing".
+parser.add_argument("--nu", type=float, default=4e-3)
 
 # --- action selection (paper: WTA + epsilon-greedy) ---
 parser.add_argument("--select", type=str, default="wta", choices=["wta", "softmax"])
@@ -106,22 +141,21 @@ parser.add_argument("--eps_decay", type=float, default=0.99)   # per step, as in
 parser.add_argument("--eps_min", type=float, default=0.05)
 
 parser.add_argument("--diagnose", type=bool, default=True)
+parser.add_argument("--diag_stride", type=int, default=4)   # probe positions
+parser.add_argument("--diag_thresh", type=int, default=4)   # spikes -> "active"
 
 args = parser.parse_args()
 
-moveChoices = 9 if args.diag else 5
+# fixed movement choice count
+moveChoices = 9 if args.diag else 5 if args.allow_stay else 4
 DEVICE = torch.device("cuda" if (torch.cuda.is_available() and args.gpu) else "cpu")
-OUT_FILE_PATH = "PAPER1_RUN/"
+OUT_FILE_PATH = "PR2_RUN/"
 
 LAYER_GC, LAYER_AC, LAYER_MC = "GC", "AC", "MC"
 
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 
-
-# --------------------------------------------------------------------------- #
-# View geometry
-# --------------------------------------------------------------------------- #
 def getLocalView(obs, row, col, view_r):
     """Flattened (2r+1)^2 - 1 egocentric patch, agent's own cell excluded."""
     padded = np.pad(obs, view_r, mode="constant", constant_values=0)
@@ -129,75 +163,6 @@ def getLocalView(obs, row, col, view_r):
     flat = patch.flatten()
     center = view_r * (2 * view_r + 1) + view_r
     return np.concatenate([flat[:center], flat[center + 1:]])
-
-# def viewIndexToOffset(view_r):
-#     """(drow, dcol) of every input index, matching getLocalView's layout exactly."""
-#     side = 2 * view_r + 1
-#     center = view_r * side + view_r
-#     offs = []
-#     for k in range(side * side - 1):
-#         cell = k if k < center else k + 1
-#         pr, pc = divmod(cell, side)
-#         offs.append((pr - view_r, pc - view_r))
-#     return np.array(offs, dtype=np.float32)
-
-# --------------------------------------------------------------------------- #
-# GRID CELL LAYER
-# --------------------------------------------------------------------------- #
-# def _hexLattice(spacing, rotation, phase, extent):
-#     """Hexagonal lattice vertices covering [-extent, extent]^2."""
-#     b1 = spacing * np.array([1.0, 0.0])
-#     b2 = spacing * np.array([0.5, np.sqrt(3.0) / 2.0])
-#     n = int(np.ceil(2.0 * extent / spacing)) + 2
-#     ij = np.array(list(itertools.product(range(-n, n + 1), repeat=2)), dtype=np.float32)
-#     pts = ij[:, :1] * b1 + ij[:, 1:] * b2
-#     c, s = np.cos(rotation), np.sin(rotation)
-#     R = np.array([[c, -s], [s, c]], dtype=np.float32)
-#     pts = pts @ R.T + phase
-#     keep = (np.abs(pts) <= extent + spacing).all(axis=1)
-#     return pts[keep]
-
-# def buildGridCellProjection(view_r, scales, n_rot, n_off, g, k, device="cpu"):
-#     """
-#     Fixed (inpt_n, n_gc) projection. Column j is grid cell j's receptive field over
-#     the egocentric view: a hexagonal lattice of 2D Gaussians (the paper's Fig. 3).
-
-#     Applying this to the pixel view -- rather than evaluating a grid code at a
-#     known prey coordinate -- keeps the network pixel-driven. The paper hands its
-#     grid cells the agent's (x,y) directly; doing that here would leak the extracted
-#     prey position and hollow out the task.
-#     """
-#     offs = viewIndexToOffset(view_r)                     # (inpt_n, 2)
-#     inpt_n = offs.shape[0]
-#     extent = float(view_r)
-
-#     rotations = [np.pi * i / max(1, n_rot) for i in range(n_rot)]
-#     side = int(round(np.sqrt(n_off)))                    # 16 -> 4x4 phase grid
-
-#     cols = []
-#     meta = []
-#     for s in scales:
-#         spacing = s * g
-#         d = (1.0 / k) * (spacing / 2.0)                  # paper: d = (1/k)(s*g/2)
-#         sigma = d / 3.0                                  # paper: sigma = d/3
-#         b1 = spacing * np.array([1.0, 0.0])
-#         b2 = spacing * np.array([0.5, np.sqrt(3.0) / 2.0])
-#         for theta in rotations:
-#             for a in range(side):
-#                 for b in range(side):
-#                     phase = (a / side) * b1 + (b / side) * b2
-#                     pts = _hexLattice(spacing, theta, phase, extent)
-#                     # distance from every view offset to its NEAREST lattice vertex
-#                     d2 = ((offs[:, None, :] - pts[None, :, :]) ** 2).sum(-1)
-#                     field = np.exp(-d2.min(axis=1) / (2.0 * sigma ** 2))
-#                     field[field < 0.01] = 0.0            # paper zeroes sub-0.01
-#                     cols.append(field.astype(np.float32))
-#                     meta.append((s, theta, a, b))
-
-#     W = np.stack(cols, axis=1)                           # (inpt_n, n_gc)
-#     peak = W.max(axis=0, keepdims=True)                  # p_max, per cell
-#     peak[peak == 0] = 1.0
-#     return torch.from_numpy(W).to(device), torch.from_numpy(peak).to(device), meta
 
 
 def gcRates(view_vec, W_grid, peak, max_rate):
@@ -207,86 +172,231 @@ def gcRates(view_vec, W_grid, peak, max_rate):
     drive[drive < 0.01] = 0.0
     return drive * max_rate
 
-# --------------------------------------------------------------------------- #
-# AC connectivity + place-field centres (for structured local inhibition)
-# --------------------------------------------------------------------------- #
-# def buildSparseMask(n_pre, n_post, sparsity, seed, device):
-#     g = torch.Generator(device="cpu").manual_seed(seed)
-#     return (torch.rand(n_pre, n_post, generator=g) < sparsity).float().to(device)
+def probeStimulus(inpt_n, side, centre_flat, cell, trail=(1.0, 0.75, 0.5, 0.25)):
+    """
+    One probe view: a prey pixel at `cell` plus the decay trail behind it.
 
-# def acPlaceCentres(W_grid, gc_ac_mask, view_r):
-#     """
-#     Effective receptive field of AC j over the view = W_grid @ mask[:, j]. Its argmax
-#     is where several sampled grid fields coincide -- i.e. the AC's place-field centre.
-#     Used only to give the recurrent inhibition a spatial structure.
-#     """
-#     eff = W_grid @ gc_ac_mask                            # (inpt_n, n_ac)
-#     idx = eff.argmax(dim=0).cpu().numpy()
-#     offs = viewIndexToOffset(view_r)
-#     return torch.from_numpy(offs[idx]).float()           # (n_ac, 2)
+    The old diagnostic used a single pixel of value 1.0. A real DotSimulator view
+    (decay=4) carries ~2.5 units of mass over 3-4 pixels, so the single pixel
+    under-drove GC by roughly 2.5x and the test declared the AC layer dead at
+    gains where it is in fact fine. This reproduces the real stimulus instead.
+    """
+    grid = np.zeros((side, side), dtype=np.float32)
+    r0, c0 = divmod(cell, side)
+    for k, amp in enumerate(trail):
+        r, c = r0, c0 - k                      # trail runs left; direction is arbitrary
+        if 0 <= r < side and 0 <= c < side and (r * side + c) != centre_flat:
+            grid[r, c] = amp
+    flat = grid.flatten()
+    return np.concatenate([flat[:centre_flat], flat[centre_flat + 1:]])
 
-# def buildRecurrent(mode, centres, n_ac, inh, radius, device, seed=0):
-#     if mode == "none":
-#         return None
-#     if mode == "random":
-#         g = torch.Generator(device="cpu").manual_seed(seed)
-#         signs = (torch.rand(n_ac, n_ac, generator=g) < 0.45).float() * 2 - 1
-#         W = torch.rand(n_ac, n_ac, generator=g) * signs
-#     else:  # "local": short-range excitation, broad surround inhibition
-#         d = torch.cdist(centres, centres)
-#         exc = torch.exp(-(d ** 2) / (2 * radius ** 2))
-#         W = exc - inh * (1.0 - exc)
-#     W.fill_diagonal_(0.0)
-#     return W.to(device)
 
-# --------------------------------------------------------------------------- #
-# Diagnostics -- the paper's Table 4 (Encoding Quality Score)
-# --------------------------------------------------------------------------- #
+def codeStats(R, pos, thresh):
+    """
+    Summarise a population code R (n_positions, n_cells) of spike counts.
+
+    Three families of number, because no single one is trustworthy alone:
+
+      active / coverage   -- is the layer alive, and at what sparsity?
+      overlap / sep       -- the paper's binary set measure (9.2 GC -> 16.6 AC).
+                             `sep` is active/overlap, which is why the old code
+                             printed `inf` for a SILENT layer: 0/0. Silence is the
+                             worst possible code, not the best, so sep is reported
+                             as None when the layer does not fire.
+      cos / nn_ratio      -- graded, threshold-free, bounded, so they never
+                             degenerate. cos is mean pairwise cosine similarity
+                             between positions (0 distinct, 1 identical).
+                             nn_ratio is the mean spatial distance from a position
+                             to its nearest neighbour IN CODE SPACE, over the
+                             distance under random pairing: ~0 means the code is
+                             smoothly position-selective, ~1 means it carries no
+                             position information. This is the number to watch --
+                             it is what the AC->MC readout actually needs.
+    """
+    P, n = R.shape
+    eye = torch.eye(P, dtype=torch.bool, device=R.device)
+
+    M = (R >= thresh).float()
+    active = M.sum(1)
+    coverage = (active > 0).float().mean().item()
+    ov = (M @ M.T)[~eye]
+    a, o = active.mean().item(), ov.mean().item()
+
+    live = R.sum(1) > 0
+    if live.sum() >= 2:
+        Rn = R[live] / R[live].norm(dim=1, keepdim=True).clamp(min=1e-9)
+        S = Rn @ Rn.T
+        Pl = int(live.sum())
+        eyel = torch.eye(Pl, dtype=torch.bool, device=R.device)
+        cos = S[~eyel].mean().item()
+        D = torch.cdist(pos[live], pos[live])
+        nn = S.masked_fill(eyel, -2.0).argmax(1)
+        nn_d = D[torch.arange(Pl, device=R.device), nn].mean().item()
+        rand_d = D[~eyel].mean().item()
+        nn_ratio = nn_d / rand_d if rand_d > 0 else float("nan")
+    else:
+        cos, nn_ratio = float("nan"), float("nan")
+
+    return dict(
+        avg_active=a, sparsity=a / n, coverage=coverage,
+        avg_overlap=o, max_off=ov.max().item() if ov.numel() else 0.0,
+        sep=(a / o if (o > 0 and coverage > 0.5) else None),
+        cos=cos, nn_ratio=nn_ratio,
+        mean_rate=R.mean().item(), max_rate=R.max().item(),
+        frac_firing=(R > 0).float().mean().item(),
+    )
+
+
 @torch.no_grad()
 def encodingQuality(net, W_grid, peak, view_r, gran, dt, max_rate,
-                    spike_thresh=4, stride=3):
+                    spike_thresh=None, stride=None):
     """
-    Sweep a single prey pixel over the view and measure, for GC and AC:
-      - mean number of active cells per position
-      - mean pairwise overlap between positions
-      - quality score = active / overlap  (paper: 9.2 GC -> 16.6 AC)
-    This is the paper's separability test, adapted to relative prey position.
+    Sweep a realistic prey stimulus over the egocentric view and measure how well
+    GC and AC separate positions. This probes the ARCHITECTURE only -- GC->AC is
+    frozen, so the answer is the same before and after training. Run it before
+    burning hours on a training job: if AC cannot separate positions, the plastic
+    AC->MC weights have nothing to learn from and will sit still.
     """
-    inpt_n = (2 * view_r + 1) ** 2 - 1
-    keep = [i for i in range(inpt_n) if (i % stride == 0)]
+    spike_thresh = args.diag_thresh if spike_thresh is None else spike_thresh
+    stride = args.diag_stride if stride is None else stride
 
-    gc_sets, ac_sets = [], []
-    ac_raw = []                      # pre-threshold counts, for debugging
-    for i in keep:
-        v = torch.zeros(inpt_n, device=DEVICE)
-        v[i] = 1.0
+    side = 2 * view_r + 1
+    inpt_n = side * side - 1
+    centre_flat = view_r * side + view_r
+
+    # Sample cells on a coarse 2-D lattice. The old code used `i % stride` over
+    # the *flattened, centre-excised* index, which with side=29 walks a diagonal
+    # and samples position space unevenly.
+    trail_len = 4
+    cells, positions = [], []
+    for r in range(0, side, max(1, stride)):
+        # start far enough in that the whole trail fits: a truncated trail is a
+        # weaker stimulus, and it used to show up as a spurious coverage failure
+        for c in range(trail_len - 1, side, max(1, stride)):
+            cell = r * side + c
+            if cell == centre_flat:
+                continue
+            cells.append(cell)
+            positions.append((r - view_r, c - view_r))
+    pos = torch.tensor(positions, dtype=torch.float32, device=DEVICE)
+
+    was_learning = net.learning
+    net.learning = False                 # never let the probe touch the weights
+
+    gc_R, ac_R, mc_R = [], [], []
+    for cell in cells:
+        v = torch.from_numpy(
+            probeStimulus(inpt_n, side, centre_flat, cell)
+        ).to(DEVICE)
         rates = gcRates(v, W_grid, peak, max_rate)
         inputs = {LAYER_GC: poisson(rates.unsqueeze(0), gran, dt, device=DEVICE)}
         net.reset_state_variables()
         net.run(inputs=inputs, time=gran, reward=0.0)
-        gc = net.monitors[LAYER_GC].get("s").squeeze().sum(0)
-        ac = net.monitors[LAYER_AC].get("s").squeeze().sum(0).float()
-        ac_raw.append(ac)
-        gc_sets.append((gc >= spike_thresh).float())
-        ac_sets.append((ac >= spike_thresh).float())
+        gc_R.append(net.monitors[LAYER_GC].get("s").squeeze().sum(0).float())
+        ac_R.append(net.monitors[LAYER_AC].get("s").squeeze().sum(0).float())
+        mc_R.append(net.monitors[LAYER_MC].get("s").squeeze().sum(0).float())
 
-    R = torch.stack(ac_raw)          # (P, n_ac) raw spike counts
-    print(f"[AC raw]  mean {R.mean():.2f} spikes/neuron   max {R.max():.0f}   "
-          f"frac>0 {(R > 0).float().mean():.3f}   frac>=4 {(R >= 4).float().mean():.4f}")
-
-    out = {}
-    for name, sets in (("GC", gc_sets), ("AC", ac_sets)):
-        M = torch.stack(sets)
-        active = M.sum(1)
-        ov = M @ M.T
-        n = ov.shape[0]
-        off = ov[~torch.eye(n, dtype=bool, device=ov.device)]
-        a, o = active.mean().item(), off.mean().item()
-        out[name] = dict(avg_active=a, avg_overlap=o,
-                         min_diag=active.min().item(), max_off=off.max().item(),
-                         quality=a / o if o > 0 else float("inf"))
     net.reset_state_variables()
-    return out
+    net.learning = was_learning
+
+    # MC is included because a dead or ceiling-pinned motor layer is just as fatal
+    # as a silent association layer, and the numbers that matter for MC are not
+    # the code-overlap ones: WTA reads the ARGMAX over subpopulation spike counts,
+    # so what decides whether action selection works is the MARGIN between
+    # subpopulations and whether that argmax actually varies with position.
+    MC = torch.stack(mc_R)                                # (P, n_mc)
+    sub = MC.view(MC.shape[0], moveChoices, -1).sum(2)    # (P, n_actions)
+    top2 = sub.topk(2, dim=1).values
+    denom = sub.mean(1).clamp(min=1e-9)
+    mc_extra = dict(
+        wta_margin=((top2[:, 0] - top2[:, 1]) / denom).mean().item(),
+        tie_frac=(top2[:, 0] == top2[:, 1]).float().mean().item(),
+        dead_frac=(sub.sum(1) == 0).float().mean().item(),
+        n_winners=len(torch.unique(sub.argmax(1))),
+        ceiling=MC.max().item() / gran,
+    )
+
+    return {"GC": codeStats(torch.stack(gc_R), pos, spike_thresh),
+            "AC": codeStats(torch.stack(ac_R), pos, spike_thresh),
+            "MC": {**codeStats(MC, pos, spike_thresh), **mc_extra},
+            "_n_probe": len(cells)}
+
+
+def reportEncodingQuality(q, title="Encoding quality"):
+    """Print the diagnostic and, critically, name the right knob when it fails."""
+    print(f"\n[{title}]  {q['_n_probe']} probe positions, "
+          f"active = >={args.diag_thresh} spikes / {args.granularity} ms",
+          flush=True)
+    print("  layer   active  sparsity  coverage  overlap    sep     cos  nn_ratio"
+          "   spikes/cell", flush=True)
+    for k in ("GC", "AC", "MC"):
+        v = q[k]
+        sep = "   --  " if v["sep"] is None else f"{v['sep']:7.1f}"
+        print(f"  {k:5s}  {v['avg_active']:7.1f}  {v['sparsity']:8.3f}  "
+              f"{v['coverage']:8.2f}  {v['avg_overlap']:7.1f}  {sep}  "
+              f"{v['cos']:6.3f}  {v['nn_ratio']:8.3f}  {v['mean_rate']:11.2f}",
+              flush=True)
+    print("  (paper's sep: GC 9.2 -> AC 16.6.  nn_ratio: lower is better, "
+          "~1.0 means no position info.)", flush=True)
+
+    ac = q["AC"]
+    lo, hi = 0.25 * args.ac_target_sparsity, 3.0 * args.ac_target_sparsity
+    if ac["frac_firing"] < 0.01:
+        print("  !! AC silent. Raise --ac_gain, or lower --rec_inh -- and check "
+              "that the recurrent budget is not swamping the feedforward drive.",
+              flush=True)
+    elif ac["sparsity"] > hi:
+        print(f"  !! AC saturated ({ac['sparsity']:.0%} active vs target "
+              f"{args.ac_target_sparsity:.0%}). Lower --ac_gain or raise "
+              f"--rec_inh. Dense codes overlap, so AC->MC cannot bind an action "
+              f"to a position.", flush=True)
+    elif ac["sparsity"] < lo:
+        print(f"  !! AC too sparse ({ac['sparsity']:.1%} vs target "
+              f"{args.ac_target_sparsity:.0%}). Raise --ac_gain.", flush=True)
+    elif ac["coverage"] < 0.9:
+        print(f"  !! AC is at the right sparsity overall, but only "
+              f"{ac['coverage']:.0%} of positions have ANY cell clearing "
+              f"{args.diag_thresh} spikes -- some part of the view is a blind "
+              f"spot. Raise --ac_gain slightly, or lower --diag_thresh if "
+              f"{args.granularity} ms is simply too short a window.", flush=True)
+    elif not (ac["nn_ratio"] < 0.6):
+        print(f"  !! AC alive at the right sparsity but nn_ratio="
+              f"{ac['nn_ratio']:.2f}: the code is not position-selective. Try a "
+              f"smaller --rec_radius, or --rec_mode none to check whether the "
+              f"recurrence is what is smearing it.", flush=True)
+    else:
+        print(f"  OK: AC {ac['sparsity']:.1%} active, coverage "
+              f"{ac['coverage']:.0%}, nn_ratio {ac['nn_ratio']:.2f}.", flush=True)
+
+    if q["AC"]["sep"] is not None and q["GC"]["sep"] is not None \
+            and q["AC"]["sep"] < q["GC"]["sep"]:
+        print("  note: AC separability is BELOW GC -- the association layer is "
+              "losing information the grid code already had.", flush=True)
+
+    mc = q["MC"]
+    print(f"  MC readout: {mc['mean_rate']:.2f} spikes/cell "
+          f"({mc['ceiling']:.0%} of the {args.granularity}-step ceiling at peak), "
+          f"WTA margin {mc['wta_margin']:.3f}, ties {mc['tie_frac']:.0%}, "
+          f"{mc['n_winners']}/{moveChoices} distinct winners over "
+          f"{q['_n_probe']} positions", flush=True)
+    if mc["dead_frac"] > 0.1:
+        print(f"  !! MC silent at {mc['dead_frac']:.0%} of positions -- WTA falls "
+              f"back to a random action there. Raise --ac_mc_init.", flush=True)
+    elif mc["ceiling"] > 0.5:
+        print(f"  !! MC pinned near its firing ceiling. Subpopulation counts "
+              f"cannot separate, so WTA is close to random. Lower --ac_mc_init "
+              f"AND --w_max -- w_max alone matters because MSTDPET will otherwise "
+              f"push every weight back up to the cap, flattening the readout "
+              f"again.", flush=True)
+    elif mc["tie_frac"] > 0.5 or mc["wta_margin"] < 0.05:
+        print(f"  !! MC subpopulations barely differ (margin "
+              f"{mc['wta_margin']:.3f}, ties {mc['tie_frac']:.0%}). The readout "
+              f"has no resolution yet; expected before training if AC->MC starts "
+              f"uniform, but it must grow as |dW_ac_mc| grows.", flush=True)
+    elif mc["n_winners"] < 2:
+        print(f"  !! MC always picks the same action regardless of position -- "
+              f"check the AC->MC mask is not concentrating on one subpopulation.",
+              flush=True)
 
 
 # --------------------------------------------------------------------------- #
@@ -415,6 +525,10 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
         action = int(rng.integers(0, env.action_space.n))
         last_active_ac = torch.zeros(net.layers[LAYER_AC].n, device=DEVICE)
         clock = time.time()
+        # Per-episode health counters: if ac_frac is ~0 the plastic AC->MC weights
+        # cannot move, so w_delta being ~0 is a symptom, not the disease.
+        w0 = feat_ac_mc.value.detach().clone()
+        ac_frac_sum, mc_frac_sum = 0.0, 0.0
 
         while not done:
             step += 1
@@ -461,6 +575,13 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
                 r += 20.0
             reward = torch.tensor(r, dtype=torch.float32, device=DEVICE)
 
+    #         def gcRates(view_vec, W_grid, peak, max_rate):
+    # """view (inpt_n,) -> grid-cell firing rates (n_gc,). Paper: f = p/p_max * f_max."""
+    # drive = view_vec @ W_grid                            # (n_gc,)
+    # drive = (drive / peak.squeeze(0)).clamp(0.0, 1.0)
+    # drive[drive < 0.01] = 0.0
+    # return drive * max_rate
+
             # ---- GC encoding -> network --------------------------------------
             rates = gcRates(view, W_grid, peak, args.gc_max_rate)
             inputs = {LAYER_GC: poisson(rates.unsqueeze(0), gran, dt, device=DEVICE)}
@@ -476,6 +597,8 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
             mc = spikes[LAYER_MC].get("s").squeeze()          # (time, n_mc)
             ac = spikes[LAYER_AC].get("s").squeeze()
             last_active_ac = (ac.sum(0) >= 4).float()
+            ac_frac_sum += last_active_ac.mean().item()
+            mc_frac_sum += (mc.sum(0) > 0).float().mean().item()
 
             action = (wtaAction(mc, env.action_space.n, eps, rng)
                       if args.select == "wta"
@@ -504,8 +627,21 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
         if net.reward_fn is not None:
             net.reward_fn.update(accumulated_reward=total_reward, steps=step)
 
+        w_now = feat_ac_mc.value.detach()
+        dw = (w_now - w0).abs()
+        live = ac_mc_mask.bool()
+        pinned = ((w_now[live] >= args.w_max - 1e-6) |
+                  (w_now[live] <= 1e-6)).float().mean().item()
         print(f"Episode {ep}: total reward {total_reward:.2f}, "
-              f"intercepts {intercepts}, eps {eps:.3f}")
+              f"intercepts {intercepts}, eps {eps:.3f} | "
+              f"AC active {ac_frac_sum / max(1, step):.1%}, "
+              f"MC active {mc_frac_sum / max(1, step):.1%} | "
+              f"|dW_ac_mc| mean {dw.mean():.2e} max {dw.max():.2e}, "
+              f"{pinned:.0%} of live synapses at a bound")
+        if pinned > 0.9:
+            print("  !! AC->MC is pinned at its bounds: lower --nu or raise "
+                  "--w_max. A saturated weight matrix cannot express a policy "
+                  "and will look frozen on the weight plots.")
         os.makedirs(OUT_FILE_PATH, exist_ok=True)
 
         if capturing and replay_frames:
@@ -612,9 +748,14 @@ def main():
     # create network
     net = Network(dt=args.dt)
     gc = Input(n=n_gc, shape=[1, 1, 1, 1, n_gc], traces=True)
+    # lbound matters: AC->AC inhibition is subtractive and unbounded below, so
+    # without a floor one synchronous burst drives v to -1000s of mV and the
+    # layer is dead for the rest of the episode (reset_state_variables only runs
+    # once per episode, not once per decision).
     ac = LIFNodes(n=args.ac, traces=True,
                   rest=-64.0, reset=-70.0, thresh=-45.0,
-                  refrac=1, tc_decay=20.0, tc_trace=20.0)
+                  refrac=1, tc_decay=20.0, tc_trace=20.0,
+                  lbound=args.ac_lbound)
     n_mc = moveChoices * args.mc_pop
     mc = LIFNodes(n=n_mc, traces=True,
                   rest=-64.0, reset=-64.0, thresh=-49.0,
@@ -653,28 +794,47 @@ def main():
     centre_idx = effective_rf.argmax(dim=0).cpu().numpy()
     ac_centres = torch.from_numpy(view_offsets[centre_idx]).float()   # (n_ac, 2)
  
+    def normColumns(M, budget):
+        """Scale each column so its entries sum to `budget` (a per-neuron mV
+        total). Without this the recurrent drive scales with --ac: at ac=1000 the
+        old un-normalised Mexican hat gave every AC a row sum of about -790 mV,
+        which is ~300x the feedforward drive. That is a negative-feedback loop so
+        stiff that raising --ac_gain cannot move AC activity at all."""
+        return M / M.sum(0, keepdim=True).clamp(min=1e-6) * budget
+
     feat_rec = None
+    W_rec = None
     if args.rec_mode == "none":
-        W_rec = None                                     # paper-faithful ablation
+        pass                                             # paper-faithful ablation
     elif args.rec_mode == "random":
         # Unstructured reservoir: ~45% excitatory, ~55% inhibitory, uniform mags.
         rec_gen = torch.Generator(device="cpu").manual_seed(args.seed)
-        signs = (torch.rand(args.ac, args.ac, generator=rec_gen) < 0.45).float() * 2 - 1
-        W_rec = torch.rand(args.ac, args.ac, generator=rec_gen) * signs
+        mag = torch.rand(args.ac, args.ac, generator=rec_gen)
+        pos_m = (torch.rand(args.ac, args.ac, generator=rec_gen) < 0.45).float()
+        E, I = mag * pos_m, mag * (1.0 - pos_m)
+        E.fill_diagonal_(0.0); I.fill_diagonal_(0.0)
+        W_rec = normColumns(E, args.rec_exc) - normColumns(I, args.rec_inh)
     else:
         # Local: Gaussian excitation between ACs with nearby place centres,
         # flat inhibition everywhere else (centre-surround / Mexican hat).
-        dist = torch.cdist(ac_centres, ac_centres)       # (n_ac, n_ac)
+        dist = torch.cdist(ac_centres, ac_centres) # calc dist
         excite = torch.exp(-(dist ** 2) / (2 * args.rec_radius ** 2))
-        W_rec = excite - args.rec_inh * (1.0 - excite)
- 
-    W_rec.fill_diagonal_(0.0)                        # no self-connections
-    feat_rec = Weight(name="w_rec", value=W_rec.to(DEVICE))
-    net.add_connection(
-        MulticompartmentConnection(source=ac, target=ac,
-                                    pipeline=[feat_rec], device=DEVICE),
-        source=LAYER_AC, target=LAYER_AC)
-    print(f"[AC->AC] recurrent mode='{args.rec_mode}'")
+        inhib = 1.0 - excite
+        excite.fill_diagonal_(0.0); inhib.fill_diagonal_(0.0)
+        W_rec = normColumns(excite, args.rec_exc) - normColumns(inhib, args.rec_inh)
+
+    if W_rec is not None:
+        W_rec.fill_diagonal_(0.0)                    # no self-connections
+        feat_rec = Weight(name="w_rec", value=W_rec.to(DEVICE))
+        net.add_connection(
+            MulticompartmentConnection(source=ac, target=ac,
+                                        pipeline=[feat_rec], device=DEVICE),
+            source=LAYER_AC, target=LAYER_AC)
+        print(f"[AC->AC] mode='{args.rec_mode}'  per-neuron budgets: "
+              f"exc +{args.rec_exc:.1f} mV / inh -{args.rec_inh:.1f} mV  "
+              f"(net row sum {W_rec.sum(1).mean():+.2f})")
+    else:
+        print("[AC->AC] mode='none' -- no recurrent connection")
 
     # ======================================================================= #
     # STEP 5 -- AC -> MC : the ONLY plastic pathway
@@ -690,7 +850,7 @@ def main():
  
     # Start near-uniform: before learning, no AC prefers any particular action,
     # which is the flat radar plot in the paper's Fig. 9 "pre-training" panels.
-    W_ac_mc = ac_mc_mask * torch.rand(args.ac, n_mc, device=DEVICE) * 6.0
+    W_ac_mc = ac_mc_mask * torch.rand(args.ac, n_mc, device=DEVICE) * args.ac_mc_init
  
     feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc,
                         learning_rule=MSTDPET, nu=[args.nu, args.nu])
@@ -727,16 +887,10 @@ def main():
     # -- it would give the same answer before and after training, since the code
     # is frozen. Run this before burning hours on a training job.
     if args.diagnose:
-        q = encodingQuality(net, W_grid, peak, view_r,
-                            args.granularity, args.dt, args.gc_max_rate)
-        print("\n[Encoding quality]  (paper: GC 9.2 -> AC 16.6)",flush=True)
-        for k, v in q.items():
-            print(f"  {k}: active {v['avg_active']:.1f}, "
-                  f"overlap {v['avg_overlap']:.1f}, score {v['quality']:.1f}",flush=True)
-        if q["AC"]["avg_active"] < 5:
-            print("  !! AC layer nearly silent -- raise --ac_gain", flush=True)
-        if q["AC"]["avg_active"] > 0.20 * args.ac:
-            print("  !! AC layer saturated -- lower --ac_gain or raise --rec_inh", flush=True)
+        reportEncodingQuality(
+            encodingQuality(net, W_grid, peak, view_r,
+                            args.granularity, args.dt, args.gc_max_rate),
+            "Encoding quality (pre-training)")
  
     environment = DotSimulator(
         args.steps, decay=args.decay, herrs=args.herrs, diag=args.diag,
@@ -762,12 +916,10 @@ def main():
     net.learning = False
  
     if args.diagnose:
-        q = encodingQuality(net, W_grid, peak, view_r,
-                            args.granularity, args.dt, args.gc_max_rate)
-        print("\n[Encoding quality after training]")
-        for k, v in q.items():
-            print(f"  {k}: active {v['avg_active']:.1f}, "
-                  f"overlap {v['avg_overlap']:.1f}, score {v['quality']:.1f}")
+        reportEncodingQuality(
+            encodingQuality(net, W_grid, peak, view_r,
+                            args.granularity, args.dt, args.gc_max_rate),
+            "Encoding quality (post-training)")
         print()
  
     print("Testing:")
@@ -781,143 +933,6 @@ def main():
         replay_prefix="replay_test", view_r=view_r,
         learning=False, eps_start=0.0,
     )
-
-# # --------------------------------------------------------------------------- #
-# def main():
-#     net = Network(dt=args.dt)
-#     inpt_n = (2 * args.view_r + 1) ** 2 - 1
-
-#     # ---------------- GC: fixed multi-scale periodic basis ------------------ #
-#     W_grid, peak, gc_meta = buildGridCellProjection(
-#         args.view_r, args.gc_scales, args.gc_rotations, args.gc_offsets,
-#         args.gc_global_scale, args.gc_sharpness, device=DEVICE,
-#     )
-#     n_gc = W_grid.shape[1]
-#     print(f"[GC] {n_gc} grid cells "
-#           f"({len(args.gc_scales)} scales x {args.gc_rotations} rotations "
-#           f"x {args.gc_offsets} offsets) over {inpt_n} view cells")
-
-#     gc = Input(n=n_gc, shape=[1, 1, 1, 1, n_gc], traces=True)
-
-#     # ---------------- AC: coincidence-detecting LIF (paper Table 3) --------- #
-#     ac = LIFNodes(n=args.ac, traces=True,
-#                   rest=-64.0, reset=-70.0, thresh=-45.0,
-#                   refrac=1, tc_decay=20.0, tc_trace=20.0)
-
-#     # ---------------- MC: one subpopulation per action ---------------------- #
-#     n_mc = moveChoices * args.mc_pop
-#     mc = LIFNodes(n=n_mc, traces=True,
-#                   rest=-64.0, reset=-64.0, thresh=-49.0,
-#                   refrac=0, tc_decay=20.0, tc_trace=20.0)
-
-#     net.add_layer(gc, name=LAYER_GC)
-#     net.add_layer(ac, name=LAYER_AC)
-#     net.add_layer(mc, name=LAYER_MC)
-
-#     # GC -> AC : sparse, fixed, excitatory (paper: 12%, never modified)
-#     gc_ac_mask = buildSparseMask(n_gc, args.ac, args.gc_ac_sparsity,
-#                                  args.seed, DEVICE)
-#     W_gc_ac = gc_ac_mask * torch.rand(n_gc, args.ac, device=DEVICE)
-#     fan_in = gc_ac_mask.sum(0).mean().clamp(min=1.0)
-#     W_gc_ac = W_gc_ac / fan_in.sqrt() * args.ac_gain
-#     feat_gc_ac = Weight(name="w_gc_ac", value=W_gc_ac)
-#     net.add_connection(
-#         MulticompartmentConnection(source=gc, target=ac,
-#                                    pipeline=[feat_gc_ac], device=DEVICE),
-#         source=LAYER_GC, target=LAYER_AC)
-
-    
-#     centres = acPlaceCentres(W_grid, gc_ac_mask, args.view_r)
-#     W_rec = buildRecurrent(args.rec_mode, centres, args.ac,
-#                            args.rec_inh, args.rec_radius, DEVICE, args.seed)
-#     feat_rec = None
-#     if W_rec is not None:
-#         feat_rec = Weight(name="w_rec", value=W_rec)
-#         net.add_connection(
-#             MulticompartmentConnection(source=ac, target=ac,
-#                                        pipeline=[feat_rec], device=DEVICE),
-#             source=LAYER_AC, target=LAYER_AC)
-
-#     # AC -> MC : the ONLY plastic pathway (paper), 40% sparse
-#     ac_mc_mask = buildSparseMask(args.ac, n_mc, args.ac_mc_sparsity,
-#                                  args.seed + 1, DEVICE)
-#     W_ac_mc = ac_mc_mask * torch.rand(args.ac, n_mc, device=DEVICE) * 6.0
-#     feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc,
-#                         learning_rule=MSTDPET, nu=[args.nu, args.nu])
-#     net.add_connection(
-#         MulticompartmentConnection(source=ac, target=mc,
-#                                    pipeline=[feat_ac_mc], device=DEVICE),
-#         source=LAYER_AC, target=LAYER_MC)
-
-#     net.to(DEVICE)
-
-#     weight_features = {"gc_ac": feat_gc_ac, "ac_mc": feat_ac_mc}
-#     if feat_rec is not None:
-#         weight_features["recurrent"] = feat_rec
-
-#     spikes = {}
-#     for layer in net.layers:
-#         spikes[layer] = Monitor(net.layers[layer], state_vars=["s"],
-#                                 time=int(args.granularity / args.dt), device=DEVICE)
-#         net.add_monitor(spikes[layer], name=layer)
-
-#     # ---------------- separability check before training -------------------- #
-#     if args.diagnose:
-#         q = encodingQuality(net, W_grid, peak, args.view_r,
-#                             args.granularity, args.dt, args.gc_max_rate)
-#         print("\n[Encoding quality]  (paper: GC 9.2 -> AC 16.6)")
-#         for k, v in q.items():
-#             print(f"  {k}: active {v['avg_active']:.1f}, "
-#                   f"overlap {v['avg_overlap']:.1f}, score {v['quality']:.1f}")
-#         if q["AC"]["avg_active"] < 5:
-#             print("  !! AC layer nearly silent -- raise --ac_gain")
-#         if q["AC"]["avg_active"] > 0.20 * args.ac:
-#             print("  !! AC layer saturated -- lower --ac_gain or raise --rec_inh")
-#         print()
-
-#     environment = DotSimulator(
-#         args.steps, decay=args.decay, herrs=args.herrs, diag=args.diag,
-#         randr=args.randr, write=args.write, mute=args.mute,
-#         bound_hand=args.boundh, fit_func=args.fit_func,
-#         allow_stay=args.allow_stay, pandas=args.pandas, fpath=OUT_FILE_PATH,
-#     )
-#     environment.reset()
-
-#     print("Training:")
-#     environment.addFileSuffix("train")
-#     final_eps = runSimulator(
-#         net, environment, spikes, args.trn_eps, W_grid, peak, ac_mc_mask,
-#         feat_ac_mc, gran=args.granularity,
-#         rfname=genFileName("rew", "train"), pfname=genFileName("perf", "train"),
-#         weight_features=weight_features, render_replays=args.render_replays,
-#         render_every=args.render_every, replay_fps=args.replay_fps,
-#         replay_prefix="replay_train", view_r=args.view_r,
-#         learning=True, eps_start=args.eps_start,
-#     )
-
-#     net.learning = False
-
-#     if args.diagnose:
-#         q = encodingQuality(net, W_grid, peak, args.view_r,
-#                             args.granularity, args.dt, args.gc_max_rate)
-#         print("\n[Encoding quality after training]")
-#         for k, v in q.items():
-#             print(f"  {k}: active {v['avg_active']:.1f}, "
-#                   f"overlap {v['avg_overlap']:.1f}, score {v['quality']:.1f}")
-#         print()
-
-#     print("Testing:")
-#     environment.changeFileSuffix("train", "test")
-#     runSimulator(
-#         net, environment, spikes, args.tst_eps, W_grid, peak, ac_mc_mask,
-#         feat_ac_mc, gran=args.granularity,
-#         rfname=genFileName("rew", "test"), pfname=genFileName("perf", "test"),
-#         weight_features=weight_features, render_replays=args.render_replays,
-#         render_every=args.render_every, replay_fps=args.replay_fps,
-#         replay_prefix="replay_test", view_r=args.view_r,
-#         learning=False, eps_start=0.0,
-#     )
-
 
 if __name__ == "__main__":
     main()
