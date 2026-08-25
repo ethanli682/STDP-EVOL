@@ -26,6 +26,12 @@ logs/*
 .claude/
 data/*
 
+perf_*
+replay_*
+weights_*
+motorpolar_*
+
+
 __pycache__/
 *.pyc
 *.egg-info/
