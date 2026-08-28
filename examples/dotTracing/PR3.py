@@ -114,32 +114,21 @@ parser.add_argument("--raster_layers", type=str, nargs="+",
 parser.add_argument("--raster_max_neurons", type=int, default=200)
 
 # --- GC layer (paper: 5 scales x 7 rotations x 16 offsets = 560) ---
-parser.add_argument("--gc_scales", type=int, nargs="+", default=[3, 5, 7, 11, 13])
+parser.add_argument("--gc_scales", type=int, nargs="+", default=[5, 7, 11, 13, 17])
 parser.add_argument("--gc_rotations", type=int, default=7)
 parser.add_argument("--gc_offsets", type=int, default=16)   # 4x4 phase grid
 parser.add_argument("--gc_global_scale", type=float, default=1.5)  # paper's g
 parser.add_argument("--gc_sharpness", type=float, default=1.0)     # paper's k
 parser.add_argument("--gc_max_rate", type=float, default=80.0)     # 8 spikes / 100 ms
-# Reference frame the grid fields live in:
-#   ego  -- fields over the (2r+1)^2-1 egocentric patch. The agent's position is
-#           implicit in the centring, so the code is TRANSLATION INVARIANT: the
-#           same prey offset gives the same GC pattern anywhere in the arena.
-#   allo -- fields over the actual arena cells. Two channels go through the same
-#           lattice bank (agent one-hot, prey+trail), so n_gc doubles. Absolute
-#           positions, so translation invariance is GONE -- read the docstring
-#           note before switching.
-parser.add_argument("--gc_frame", type=str, default="allo", choices=["ego", "allo"])
 
 # --- AC layer (paper: 2000 neurons, 12% GC->AC sparsity) ---
 parser.add_argument("--ac", type=int, default=1000)   # paper uses 2000; 1000 is faster
 parser.add_argument("--gc_ac_sparsity", type=float, default=0.12)
-parser.add_argument("--ac_gain", type=float, default=25.0)  
+parser.add_argument("--ac_gain", type=float, default=25.0)   # TUNE ME (see notes)
 parser.add_argument("--ac_lbound", type=float, default=-80.0)  # v floor; see notes
-parser.add_argument("--rec_mode", type=str, default="local",
-                    choices=["none", "random", "local"])
-# rec_exc / rec_inh are TOTAL per-neuron budgets in mV: the drive a neuron would
-# receive if every one of its excitatory (resp. inhibitory) presynaptic partners
-# fired on the same timestep. Column-normalised, so they do not scale with --ac.
+parser.add_argument("--rec_mode", type=str, default="random",
+                    choices=["random", "local"])
+
 parser.add_argument("--rec_exc", type=float, default=15.0)
 parser.add_argument("--rec_inh", type=float, default=25.0)
 parser.add_argument("--rec_radius", type=float, default=4.0)
@@ -185,72 +174,12 @@ def getLocalView(obs, row, col, view_r):
     return np.concatenate([flat[:center], flat[center + 1:]])
 
 
-def gcRates(chan, W_grid, peak, max_rate):
-    """
-    chan (n_ch, n_pos) -> firing rates (n_ch * n_lattice,). Paper: f = p/p_max * f_max.
-
-    Each channel is projected through the SAME lattice bank and the results are
-    concatenated, so ego mode (one channel) is numerically unchanged while allo
-    mode gets one bank per channel without materialising a block-diagonal matrix.
-    A bare 1-D vector is still accepted and treated as a single channel.
-    """
-    if chan.dim() == 1:
-        chan = chan.unsqueeze(0)
-    drive = chan @ W_grid                                # (n_ch, n_lattice)
-    drive = (drive / peak).clamp(min=0.0, max=1.0)       # peak is (1, n_lattice)
+def gcRates(view_vec, W_grid, peak, max_rate):
+    """view (inpt_n,) -> grid-cell firing rates (n_gc,). Paper: f = p/p_max * f_max."""
+    drive = view_vec @ W_grid                            # (n_gc,)
+    drive = (drive / peak.squeeze(0)).clamp(min=0.0, max=1.0)
     drive[drive < 0.01] = 0.0
-    return (drive * max_rate).reshape(-1)
-
-
-def buildGridFields(coords, extent, scales, rotations, offsets,
-                    global_scale, sharpness):
-    """
-    Multi-scale hexagonal grid-cell basis over an arbitrary set of 2-D positions.
-
-    `coords` (n_pos, 2) must already be centred on 0, so rotations and phases are
-    anchored at the middle of whatever space it describes -- egocentric offsets or
-    absolute arena cells. Returns (W (n_pos, n_lattice), peak (1, n_lattice)).
-    """
-    phase_side = int(round(np.sqrt(offsets)))
-    fields = []
-    for sc in scales:
-        spacing = sc * global_scale          # distance between lattice peaks
-        d = (1.0 / sharpness) * (spacing / 2.0)
-        sigma = d / 3.0
-
-        # Two basis vectors 60 degrees apart generate a hexagonal lattice.
-        b1 = spacing * np.array([1.0, 0.0])
-        b2 = spacing * np.array([0.5, np.sqrt(3.0) / 2.0])
-
-        # Integer combinations i*b1 + j*b2 give every vertex. Generate enough to
-        # cover the space even after rotation and phase shifting.
-        n_tile = int(np.ceil(2.0 * extent / spacing)) + 2
-        ij = np.array(list(itertools.product(range(-n_tile, n_tile + 1), repeat=2)),
-                      dtype=np.float32)
-        lattice_base = ij[:, :1] * b1 + ij[:, 1:] * b2
-
-        for r_i in range(rotations):
-            theta = np.pi * r_i / max(1, rotations)
-            c, sn = np.cos(theta), np.sin(theta)
-            R = np.array([[c, -sn], [sn, c]], dtype=np.float32)
-            lattice_rot = lattice_base @ R.T
-
-            for a in range(phase_side):
-                for b in range(phase_side):
-                    phase = (a / phase_side) * b1 + (b / phase_side) * b2
-                    pts = lattice_rot + phase
-                    # drop vertices that can never be the nearest peak to any
-                    # position -- they only cost time
-                    pts = pts[(np.abs(pts) <= extent + spacing).all(axis=1)]
-                    d2 = ((coords[:, None, :] - pts[None, :, :]) ** 2).sum(-1)
-                    field = np.exp(-d2.min(axis=1) / (2.0 * sigma ** 2))
-                    field[field < 0.01] = 0.0     # paper zeroes sub-0.01 tails
-                    fields.append(field.astype(np.float32))
-
-    W = np.stack(fields, axis=1)                 # (n_pos, n_lattice)
-    pk = W.max(axis=0, keepdims=True)
-    pk[pk == 0] = 1.0
-    return W, pk
+    return drive * max_rate
 
 # select action based on the largest spiking population
 def wtaAction(mc_spikes, n_actions, eps, rng):
@@ -274,7 +203,7 @@ def softmaxAction(mc_spikes, n_actions):
 # todo: reward is currently more sparse but the reward still needs
 # to serve as an indicator
 def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
-                 feat_ac_mc, encode_fn, gran=100, rfname="", pfname="",
+                 feat_ac_mc, gran=100, rfname="", pfname="",
                  weight_features=None, render_replays=False, render_every=25,
                  replay_fps=20, replay_prefix="replay", view_r=14,
                  learning=True, eps_start=1.0):
@@ -322,6 +251,13 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
         w0 = feat_ac_mc.value.detach().clone()
         ac_frac_sum, mc_frac_sum = 0.0, 0.0
 
+
+
+        # todo00: the ego centric view represents what should be spiking and what shouldnt
+        # whatever is inside the view: the agent's position should always indicate where the agent is
+        # if the target is inside the view: the target's position should spike
+        # connect the different layers densely to a reasoning layer
+        # the reasoning layer connects to the motor cortex
         while not done:
             step += 1
 
@@ -333,10 +269,11 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
             obs, _, done, intercept = env.step(action)
 
             net_obs = obs.copy()
-            net_obs[env.netDot.row, env.netDot.col] = 0.0
 
-            # encode the observation in whichever reference frame is configured
-            gc_in = encode_fn(net_obs, env.netDot.row[0], env.netDot.col[0])
+            # get the agent's centered view
+            view = torch.Tensor(
+                getLocalView(net_obs, env.netDot.row[0], env.netDot.col[0], view_r)
+            ).to(DEVICE)
 
             # agent row+col
             cr, cc = env.netDot.row[0], env.netDot.col[0]
@@ -373,7 +310,7 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
     # return drive * max_rate
 
             # ---- GC encoding -> network --------------------------------------
-            rates = gcRates(gc_in, W_grid, peak, args.gc_max_rate)
+            rates = gcRates(view, W_grid, peak, args.gc_max_rate)
             inputs = {LAYER_GC: poisson(rates.unsqueeze(0), gran, dt, device=DEVICE)}
 
             # run network with gridcell firing as input to get a move choice
@@ -496,82 +433,74 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
 
 # --------------------------------------------------------------------------- #
 def main():
-    # egocentric view setup
-    view_r = args.view_r
-    side_v = 2 * view_r + 1                      # window is side_v x side_v
-    inpt_n = side_v * side_v - 1                 # minus the excluded centre
-    centre_flat = view_r * side_v + view_r       # index of the agent's own cell (middle idx)
+    dim = args.dim
+    # store all coordinate pairs
+    world_xy = np.array([(r, c) for r in range(dim) for c in range(dim)],
+                        dtype=np.float32)               
+    n_world = world_xy.shape[0]
+    # centre the lattice on the board so rotations pivot about the middle
+    board_centre = np.array([(dim - 1) / 2.0, (dim - 1) / 2.0], dtype=np.float32)
+    world_rel = world_xy - board_centre                       # (n_world, 2)
+    extent = dim / 2.0
 
-    # remove the agent pixel and store relative locations of each neuron to agent
-    view_offsets = []
-    for k in range(inpt_n):
-        # re-insert the gap left by the excised centre cell, then un-flatten
-        cell = k if k < centre_flat else k + 1
-        pr, pc = divmod(cell, side_v)
-        view_offsets.append((pr - view_r, pc - view_r))
-    view_offsets = np.array(view_offsets, dtype=np.float32)   # (inpt_n, 2)
- 
+    phase_side = int(round(np.sqrt(args.gc_offsets)))
+    gc_fields, gc_meta = [], []
 
-    # ---- grid cell layer: choose the reference frame the fields live in ----
-    if args.gc_frame == "ego":
-        gc_coords = view_offsets                 # (inpt_n, 2), already centred
-        gc_extent = float(view_r)
-        n_ch = 1
-    else:
-        # Absolute arena cells, centred so rotations and phases are anchored at
-        # the middle of the arena rather than a corner.
-        rr, cc_ = np.meshgrid(np.arange(args.dim), np.arange(args.dim), indexing="ij")
-        mid = (args.dim - 1) / 2.0
-        gc_coords = np.stack([rr.ravel() - mid, cc_.ravel() - mid],
-                             axis=1).astype(np.float32)
-        gc_extent = mid
-        # Two channels: the agent's own position and the prey+trail. In ego mode
-        # the agent's position is implicit in the centring; go allocentric with
-        # the agent pixel zeroed (as net_obs does) and the network would have no
-        # idea where it is, so it has to be supplied explicitly.
-        n_ch = 2
+    for s in args.gc_scales:
+        spacing = s * args.gc_global_scale
+        d = (1.0 / args.gc_sharpness) * (spacing / 2.0)
+        sigma = d / 3.0
 
-    W_lat_np, peak_np = buildGridFields(
-        gc_coords, gc_extent, args.gc_scales, args.gc_rotations,
-        args.gc_offsets, args.gc_global_scale, args.gc_sharpness)
+        b1 = spacing * np.array([1.0, 0.0])
+        b2 = spacing * np.array([0.5, np.sqrt(3.0) / 2.0])
 
-    W_grid = torch.from_numpy(W_lat_np).to(DEVICE)   # (n_pos, n_lattice)
-    peak = torch.from_numpy(peak_np).to(DEVICE)      # (1, n_lattice)
-    n_pos, n_lat = W_grid.shape
-    n_gc = n_ch * n_lat
-    print(f"[GC] frame='{args.gc_frame}'  positions {n_pos}  lattice cells {n_lat}"
-          f"  channels {n_ch}  -> n_gc {n_gc}")
+        n_tile = int(np.ceil(2.0 * extent / spacing)) + 2
+        ij = np.array(list(itertools.product(range(-n_tile, n_tile + 1), repeat=2)),
+                      dtype=np.float32)
+        lattice_base = ij[:, :1] * b1 + ij[:, 1:] * b2
 
-    # Per-step encoder: observation -> (n_ch, n_pos) channel stack for gcRates.
-    if args.gc_frame == "ego":
-        def encodeGC(net_obs, row, col):
-            return torch.from_numpy(np.ascontiguousarray(
-                getLocalView(net_obs, row, col, view_r),
-                dtype=np.float32)).to(DEVICE).unsqueeze(0)
-    else:
-        def encodeGC(net_obs, row, col):
-            prey = torch.from_numpy(np.ascontiguousarray(
-                net_obs.ravel(), dtype=np.float32)).to(DEVICE)
-            agent = torch.zeros(n_pos, device=DEVICE)
-            agent[int(row) * args.dim + int(col)] = 1.0
-            return torch.stack([agent, prey])
+        for r_i in range(7): # 7 rotations
+            theta = np.pi * r_i / 7
+            cos_t, sin_t = np.cos(theta), np.sin(theta)
+            R = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float32)
+            lattice_rot = lattice_base @ R.T
 
-    probes, probe_pos = buildProbes(args.gc_frame, view_r, args.dim,
-                                    args.diag_stride, n_pos)
+            # 4 phase shifts for up and down
+            for a in range(4):
+                for b in range(4):
+                    phase = (a / 4) * b1 + (b / 4) * b2
+                    pts = lattice_rot + phase
+                    # find out which points to keep (within the 28x28 grid)
+                    keep = (np.abs(pts) <= extent + spacing).all(axis=1)
+                    pts = pts[keep]
+
+                    # create gaussians
+                    d2 = ((world_rel[:, None, :] - pts[None, :, :]) ** 2).sum(-1)
+                    field = np.exp(-d2.min(axis=1) / (2.0 * sigma ** 2))
+                    field[field < 0.01] = 0.0 # cut off the gaussian tail
+                    gc_fields.append(field.astype(np.float32))
+                    gc_meta.append((s, theta, a, b))
+
+
+    W_grid_np = np.stack(gc_fields, axis=1)       
+    peak_np = W_grid_np.max(axis=0, keepdims=True)
+    peak_np[peak_np == 0] = 1.0
+    # this weights grid is the weigths of the grid cells, 
+    # which is passed into the simulator
+    # grid cell weights are from the gaussians
+    W_grid = torch.from_numpy(W_grid_np).to(DEVICE)
+    peak = torch.from_numpy(peak_np).to(DEVICE)
+    n_gc = W_grid.shape[1]
 
 
     # create network
     net = Network(dt=args.dt)
     gc = Input(n=n_gc, shape=[1, 1, 1, 1, n_gc], traces=True)
-    # lbound matters: AC->AC inhibition is subtractive and unbounded below, so
-    # without a floor one synchronous burst drives v to -1000s of mV and the
-    # layer is dead for the rest of the episode (reset_state_variables only runs
-    # once per episode, not once per decision).
     ac = LIFNodes(n=args.ac, traces=True,
                   rest=-64.0, reset=-70.0, thresh=-45.0,
                   refrac=1, tc_decay=20.0, tc_trace=20.0,
                   lbound=args.ac_lbound)
-    n_mc = moveChoices * args.mc_pop
+    n_mc = moveChoices * args.mc_pop # potentially make the default option pause. so only 4 moves
     mc = LIFNodes(n=n_mc, traces=True,
                   rest=-64.0, reset=-64.0, thresh=-49.0,
                   refrac=0, tc_decay=20.0, tc_trace=20.0)
@@ -579,11 +508,9 @@ def main():
     net.add_layer(ac, name=LAYER_AC)
     net.add_layer(mc, name=LAYER_MC)
 
-    # Each AC samples ~12% of the grid cells at random and keeps that sample for
-    # the entire run 
     mask_gen = torch.Generator(device="cpu").manual_seed(args.seed)
     gc_ac_mask = (torch.rand(n_gc, args.ac, generator=mask_gen)
-                  < args.gc_ac_sparsity).float().to(DEVICE)
+                  < 0.12).float().to(DEVICE) # sparsity at 0.12 for now
  
     # Random positive weights on the surviving synapses (GC input is excitatory).
     W_gc_ac = gc_ac_mask * torch.rand(n_gc, args.ac, device=DEVICE)
@@ -598,71 +525,36 @@ def main():
                                    pipeline=[feat_gc_ac], device=DEVICE),
         source=LAYER_GC, target=LAYER_AC)
  
-    # "local" mode gives that recurrence spatial structure. First we ask where
-    # each AC's place field actually sits: its effective receptive field over
-    # the view is W_grid @ mask[:, j] (its sampled grid fields summed), and the
-    # argmax of that is where several of them coincide -- i.e. its preferred
-    # offset. ACs with nearby preferences then excite each other, distant ones
-    # inhibit, giving a soft continuous-attractor bump rather than the
-    # unstructured noise of a random reservoir.
-    # gc_ac_mask is (n_ch*n_lat, n_ac); sum the channel blocks so the preferred
-    # position is measured in the shared position space, whichever frame we are in.
-    mask_pos = gc_ac_mask.view(n_ch, n_lat, args.ac).sum(0)      # (n_lat, n_ac)
-    effective_rf = W_grid @ mask_pos                             # (n_pos, n_ac)
-    centre_idx = effective_rf.argmax(dim=0).cpu().numpy()
-    ac_centres = torch.from_numpy(gc_coords[centre_idx]).float()  # (n_ac, 2)
- 
+
     def normColumns(M, budget):
-        """Scale each column so its entries sum to `budget` (a per-neuron mV
-        total). Without this the recurrent drive scales with --ac: at ac=1000 the
-        old un-normalised Mexican hat gave every AC a row sum of about -790 mV,
-        which is ~300x the feedforward drive. That is a negative-feedback loop so
-        stiff that raising --ac_gain cannot move AC activity at all."""
+        """
+        Scale each column so its entries sum to `budget` (a per-neuron mV
+        total). 
+        """
         return M / M.sum(0, keepdim=True).clamp(min=1e-6) * budget
 
     feat_rec = None
-    W_rec = None
-    if args.rec_mode == "none":
-        pass                                             # paper-faithful ablation
-    elif args.rec_mode == "random":
-        # Unstructured reservoir: ~45% excitatory, ~55% inhibitory, uniform mags.
-        rec_gen = torch.Generator(device="cpu").manual_seed(args.seed)
-        mag = torch.rand(args.ac, args.ac, generator=rec_gen)
-        pos_m = (torch.rand(args.ac, args.ac, generator=rec_gen) < 0.45).float()
-        E, I = mag * pos_m, mag * (1.0 - pos_m)
-        E.fill_diagonal_(0.0); I.fill_diagonal_(0.0)
-        W_rec = normColumns(E, args.rec_exc) - normColumns(I, args.rec_inh)
-    else:
-        # Local: Gaussian excitation between ACs with nearby place centres,
-        # flat inhibition everywhere else (centre-surround / Mexican hat).
-        dist = torch.cdist(ac_centres, ac_centres) # calc dist
-        excite = torch.exp(-(dist ** 2) / (2 * args.rec_radius ** 2))
-        inhib = 1.0 - excite
-        excite.fill_diagonal_(0.0); inhib.fill_diagonal_(0.0)
-        W_rec = normColumns(excite, args.rec_exc) - normColumns(inhib, args.rec_inh)
+    W_rec = None                                         
+    # Unstructured reservoir: ~45% excitatory, ~55% inhibitory, uniform mags.
+    # TODO: maybe do the motor cortex as recurrent
+    rec_gen = torch.Generator(device="cpu").manual_seed(args.seed)
+    mag = torch.rand(args.ac, args.ac, generator=rec_gen)
+    pos_m = (torch.rand(args.ac, args.ac, generator=rec_gen) < 0.45).float()
+    E, I = mag * pos_m, mag * (1.0 - pos_m)
+    E.fill_diagonal_(0.0); I.fill_diagonal_(0.0)
+    W_rec = normColumns(E, args.rec_exc) - normColumns(I, args.rec_inh)
+ 
+    W_rec.fill_diagonal_(0.0)                    # no self-connections
+    feat_rec = Weight(name="w_rec", value=W_rec.to(DEVICE))
+    net.add_connection(
+        MulticompartmentConnection(source=ac, target=ac,
+                                    pipeline=[feat_rec], device=DEVICE),
+        source=LAYER_AC, target=LAYER_AC)
 
-    if W_rec is not None:
-        W_rec.fill_diagonal_(0.0)                    # no self-connections
-        feat_rec = Weight(name="w_rec", value=W_rec.to(DEVICE))
-        net.add_connection(
-            MulticompartmentConnection(source=ac, target=ac,
-                                        pipeline=[feat_rec], device=DEVICE),
-            source=LAYER_AC, target=LAYER_AC)
-
-    # ======================================================================= #
-    # STEP 5 -- AC -> MC : the ONLY plastic pathway
-    # ======================================================================= #
-    # Everything upstream is frozen, so this single projection carries all of
-    # the learning -- exactly as in the paper, where only AC->MC is plastic.
-    # The paper modulates Hebbian updates by delta-Q from an external Q-table;
-    # here the task gives dense per-step reward, so MSTDPET (reward-modulated
-    # STDP with eligibility traces) plays the same third-factor role directly.
     ac_mc_gen = torch.Generator(device="cpu").manual_seed(args.seed + 1)
     ac_mc_mask = (torch.rand(args.ac, n_mc, generator=ac_mc_gen)
-                  < args.ac_mc_sparsity).float().to(DEVICE)
+                  < 0.40).float().to(DEVICE) # 40% sparsity for ac->mc
  
-    # Start near-uniform: before learning, no AC prefers any particular action,
-    # which is the flat radar plot in the paper's Fig. 9 "pre-training" panels.
     W_ac_mc = ac_mc_mask * torch.rand(args.ac, n_mc, device=DEVICE) * args.ac_mc_init
  
     feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc,
@@ -671,21 +563,13 @@ def main():
         MulticompartmentConnection(source=ac, target=mc,
                                    pipeline=[feat_ac_mc], device=DEVICE),
         source=LAYER_AC, target=LAYER_MC)
- 
-    # ac_mc_mask is handed to runSimulator because MSTDPET does NOT respect the
-    # zeros: left alone it would grow weights on synapses that are supposed not
-    # to exist, quietly turning a 40%-sparse projection dense. The mask is
-    # re-applied (and weights clamped to [0, w_max]) after every update.
 
  
     net.to(DEVICE)
- 
     weight_features = {"gc_ac": feat_gc_ac, "ac_mc": feat_ac_mc}
     if feat_rec is not None:
         weight_features["recurrent"] = feat_rec
 
-    # One monitor per layer, sized to the decision window. These are what the
-    # WTA readout and all the diagnostics read from.
     spikes = {}
     for layer in net.layers:
         spikes[layer] = Monitor(net.layers[layer], state_vars=["s"],
@@ -693,21 +577,17 @@ def main():
         net.add_monitor(spikes[layer], name=layer)
  
     # check spike counts
-    if args.diagnose:
-        reportEncodingQuality(
-            encodingQuality(net, W_grid, peak, probes, probe_pos,
-                            args.granularity, args.dt, args.gc_max_rate),
-            "Encoding quality (pre-training)")
+    # if args.diagnose:
+    #     reportEncodingQuality(
+    #         encodingQuality(net, W_grid, peak,
+    #                         args.granularity, args.dt, args.gc_max_rate),
+    #         "Encoding quality (pre-training)")
  
     environment = DotSimulator(
         args.steps, decay=args.decay, herrs=args.herrs, diag=args.diag,
         randr=args.randr, write=args.write, mute=args.mute,
-        bound_hand=args.boundh, fit_func=args.fit_func,
+        bound_hand=args.boundh, fit_func=args.fit_func, 
         allow_stay=args.allow_stay, pandas=args.pandas, fpath=OUT_FILE_PATH,
-        # --dim was previously declared but never passed: the env fell back to its
-        # own 28x28 default. allo mode indexes the arena directly, so a mismatch
-        # here would be a silent out-of-bounds, not a slow drift.
-        height=args.dim, width=args.dim,
     )
     environment.reset()
 
@@ -719,97 +599,35 @@ def main():
     environment.addFileSuffix("train")
     runSimulator(
         net, environment, spikes, args.trn_eps, W_grid, peak, ac_mc_mask,
-        feat_ac_mc, encodeGC, gran=args.granularity,
+        feat_ac_mc, gran=args.granularity,
         rfname=genFileName("rew", "train"), pfname=genFileName("perf", "train"),
         weight_features=weight_features, render_replays=args.render_replays,
         render_every=args.render_every, replay_fps=args.replay_fps,
-        replay_prefix="replay_train", view_r=view_r,
+        replay_prefix="replay_train",
         learning=True, eps_start=args.eps_start,
     )
- 
-    # Freeze plasticity; epsilon also goes to 0 so evaluation is pure policy.
     net.learning = False
  
-    if args.diagnose:
-        reportEncodingQuality(
-            encodingQuality(net, W_grid, peak, probes, probe_pos,
-                            args.granularity, args.dt, args.gc_max_rate),
-            "Encoding quality (post-training)")
-        print()
+    # if args.diagnose:
+    #     reportEncodingQuality(
+    #         encodingQuality(net, W_grid, peak,
+    #                         args.granularity, args.dt, args.gc_max_rate),
+    #         "Encoding quality (post-training)")
+    #     print()
  
     print("Testing:")
     environment.changeFileSuffix("train", "test")
     runSimulator(
         net, environment, spikes, args.tst_eps, W_grid, peak, ac_mc_mask,
-        feat_ac_mc, encodeGC, gran=args.granularity,
+        feat_ac_mc, gran=args.granularity,
         rfname=genFileName("rew", "test"), pfname=genFileName("perf", "test"),
         weight_features=weight_features, render_replays=args.render_replays,
         render_every=args.render_every, replay_fps=args.replay_fps,
-        replay_prefix="replay_test", view_r=view_r,
+        replay_prefix="replay_test", 
         learning=False, eps_start=0.0,
     )
 
-def preyStimulus(side, cell, trail=(1.0, 0.75, 0.5, 0.25), centre_flat=None):
-    """
-    A prey pixel at `cell` plus its decay trail, on a side x side grid.
-
-    `centre_flat` excises that cell from the flattened output (the egocentric view
-    drops the agent's own pixel); pass None to keep the full grid, which is what
-    the allocentric frame wants.
-    """
-    grid = np.zeros((side, side), dtype=np.float32)
-    r0, c0 = divmod(cell, side)
-    for k, amp in enumerate(trail):
-        r, c = r0, c0 - k              # trail runs left; direction is arbitrary
-        if 0 <= r < side and 0 <= c < side and (r * side + c) != centre_flat:
-            grid[r, c] = amp
-    flat = grid.flatten()
-    if centre_flat is None:
-        return flat
-    return np.concatenate([flat[:centre_flat], flat[centre_flat + 1:]])
-
-
-def buildProbes(frame, view_r, dim, stride, n_pos, trail_len=4):
-    """
-    Build the probe sweep for encodingQuality, in whichever frame is configured.
-
-    Returns (chans, positions): `chans` is a list of (n_ch, n_pos) tensors ready
-    for gcRates, `positions` the matching 2-D location of the prey. In allo mode
-    the agent is held at the arena centre and only the prey moves, so the sweep
-    still measures "can the code tell prey positions apart" -- the same question
-    the ego sweep asks, just in absolute coordinates.
-    """
-    trail = (1.0, 0.75, 0.5, 0.25)[:trail_len]
-    chans, positions = [], []
-    if frame == "ego":
-        side = 2 * view_r + 1
-        centre_flat = view_r * side + view_r
-        for r in range(0, side, max(1, stride)):
-            # start far enough in that the whole trail fits
-            for c in range(trail_len - 1, side, max(1, stride)):
-                cell = r * side + c
-                if cell == centre_flat:
-                    continue
-                v = preyStimulus(side, cell, trail, centre_flat=centre_flat)
-                chans.append(torch.from_numpy(v).to(DEVICE).unsqueeze(0))
-                positions.append((r - view_r, c - view_r))
-    else:
-        agent_cell = (dim // 2) * dim + (dim // 2)
-        agent = torch.zeros(n_pos, device=DEVICE)
-        agent[agent_cell] = 1.0
-        for r in range(0, dim, max(1, stride)):
-            for c in range(trail_len - 1, dim, max(1, stride)):
-                cell = r * dim + c
-                if cell == agent_cell:
-                    continue
-                prey = torch.from_numpy(
-                    preyStimulus(dim, cell, trail)).to(DEVICE)
-                chans.append(torch.stack([agent, prey]))
-                positions.append((r, c))
-    return chans, positions
-
-
-def _unusedProbeStimulus(inpt_n, side, centre_flat, cell, trail=(1.0, 0.75, 0.5, 0.25)):
+def probeStimulus(inpt_n, side, centre_flat, cell, trail=(1.0, 0.75, 0.5, 0.25)):
     """
     One probe view: a prey pixel at `cell` plus the decay trail behind it.
 
@@ -885,8 +703,8 @@ def codeStats(R, pos, thresh):
 
 
 @torch.no_grad()
-def encodingQuality(net, W_grid, peak, probes, positions, gran, dt, max_rate,
-                    spike_thresh=None):
+def encodingQuality(net, W_grid, peak, view_r, gran, dt, max_rate,
+                    spike_thresh=None, stride=None):
     """
     Sweep a realistic prey stimulus over the egocentric view and measure how well
     GC and AC separate positions. This probes the ARCHITECTURE only -- GC->AC is
@@ -895,14 +713,37 @@ def encodingQuality(net, W_grid, peak, probes, positions, gran, dt, max_rate,
     AC->MC weights have nothing to learn from and will sit still.
     """
     spike_thresh = args.diag_thresh if spike_thresh is None else spike_thresh
+    stride = args.diag_stride if stride is None else stride
+
+    side = 2 * view_r + 1
+    inpt_n = side * side - 1
+    centre_flat = view_r * side + view_r
+
+    # Sample cells on a coarse 2-D lattice. The old code used `i % stride` over
+    # the *flattened, centre-excised* index, which with side=29 walks a diagonal
+    # and samples position space unevenly.
+    trail_len = 4
+    cells, positions = [], []
+    for r in range(0, side, max(1, stride)):
+        # start far enough in that the whole trail fits: a truncated trail is a
+        # weaker stimulus, and it used to show up as a spurious coverage failure
+        for c in range(trail_len - 1, side, max(1, stride)):
+            cell = r * side + c
+            if cell == centre_flat:
+                continue
+            cells.append(cell)
+            positions.append((r - view_r, c - view_r))
     pos = torch.tensor(positions, dtype=torch.float32, device=DEVICE)
 
     was_learning = net.learning
     net.learning = False                 # never let the probe touch the weights
 
     gc_R, ac_R, mc_R = [], [], []
-    for chan in probes:
-        rates = gcRates(chan, W_grid, peak, max_rate)
+    for cell in cells:
+        v = torch.from_numpy(
+            probeStimulus(inpt_n, side, centre_flat, cell)
+        ).to(DEVICE)
+        rates = gcRates(v, W_grid, peak, max_rate)
         inputs = {LAYER_GC: poisson(rates.unsqueeze(0), gran, dt, device=DEVICE)}
         net.reset_state_variables()
         net.run(inputs=inputs, time=gran, reward=0.0)
@@ -933,7 +774,7 @@ def encodingQuality(net, W_grid, peak, probes, positions, gran, dt, max_rate,
     return {"GC": codeStats(torch.stack(gc_R), pos, spike_thresh),
             "AC": codeStats(torch.stack(ac_R), pos, spike_thresh),
             "MC": {**codeStats(MC, pos, spike_thresh), **mc_extra},
-            "_n_probe": len(probes)}
+            "_n_probe": len(cells)}
 
 def reportEncodingQuality(q, title="Encoding quality"):
     """Print the diagnostic and, critically, name the right knob when it fails."""
