@@ -72,9 +72,6 @@ from bindsnet.network.nodes import Input, LIFNodes
 from bindsnet.network.topology import MulticompartmentConnection
 from bindsnet.network.topology_features import Weight, Mask
 
-# --------------------------------------------------------------------------- #
-# Arguments
-# --------------------------------------------------------------------------- #
 parser = argparse.ArgumentParser()
 # task / env
 parser.add_argument("--steps", type=int, default=100)
@@ -111,22 +108,13 @@ parser.add_argument("--raster_replays", type=bool, default=True)
 parser.add_argument("--raster_timeline", type=bool, default=True)
 parser.add_argument("--raster_layers", type=str, nargs="+",
                     default=["PC_A", "PC_T", "AC", "MC"])
-# 0 (the default) plots EVERY neuron in the layer. Set a positive number to draw
-# an evenly spaced subsample instead, which is only worth doing if the figures get
-# too slow -- spike counts, not neuron counts, drive the cost.
-parser.add_argument("--raster_max_neurons", type=int, default=0)
-# Point cap for the episode-timeline PNG. Above this the scatter is thinned and
-# the panel is labelled "(thinned)", so a dense raster stays honest about it.
-parser.add_argument("--raster_timeline_points", type=int, default=400000)
-# Height in inches PER PANEL. With every neuron shown, the plot_spikes default of
-# 4.5in total makes a 1000-cell layer an unreadable smear.
-parser.add_argument("--raster_panel_h", type=float, default=2.0)
+parser.add_argument("--raster_max_neurons", type=int, default=200)
 
 # --- GC layer (paper: 5 scales x 7 rotations x 16 offsets = 560) ---
 parser.add_argument("--gc_scales", type=int, nargs="+", default=[5, 7, 11, 13, 17])
 parser.add_argument("--gc_rotations", type=int, default=7)
 parser.add_argument("--gc_offsets", type=int, default=16)   # 4x4 phase grid
-parser.add_argument("--gc_global_scale", type=float, default=1.5)  # paper's g
+parser.add_argument("--gc_global_scale", type=float, default=1.0)  # paper's g
 parser.add_argument("--gc_sharpness", type=float, default=1.0)     # paper's k
 parser.add_argument("--gc_max_rate", type=float, default=80.0)     # 8 spikes / 100 ms
 
@@ -142,12 +130,13 @@ parser.add_argument("--gc_pc_sparsity", type=float, default=0.05)
 parser.add_argument("--gc_pc_gain", type=float, default=25.0)  # GC -> PC (sparse)
 parser.add_argument("--pc_lbound", type=float, default=-80.0)
 
-# --- AC layer (paper: 2000 neurons) : DENSE from both place layers ---------
-parser.add_argument("--ac", type=int, default=1000)   # paper uses 2000; 1000 is faster
+# ASSOCIATION layer 
+parser.add_argument("--ac", type=int, default=1000) 
 parser.add_argument("--gc_ac_sparsity", type=float, default=0.12)
-parser.add_argument("--pc_ac_gain", type=float, default=25.0)  # PC -> AC (dense)
-parser.add_argument("--ac_gain", type=float, default=25.0)   # TUNE ME (see notes)
-parser.add_argument("--ac_lbound", type=float, default=-80.0)  # v floor; see notes
+parser.add_argument("--pc_ac_sparsity", type=float, default=0.1)
+parser.add_argument("--pc_ac_gain", type=float, default=25.0) 
+parser.add_argument("--ac_gain", type=float, default=12.0)  
+parser.add_argument("--ac_lbound", type=float, default=-80.0) 
 parser.add_argument("--rec_mode", type=str, default="random",
                     choices=["random", "local"])
 
@@ -156,21 +145,12 @@ parser.add_argument("--rec_inh", type=float, default=25.0)
 parser.add_argument("--rec_radius", type=float, default=4.0)
 parser.add_argument("--ac_target_sparsity", type=float, default=0.10)
 
-# --- MC layer (paper: 4 x 100 = 400) ---
-parser.add_argument("--mc_pop", type=int, default=80)
+# MOTOR layer 100 neurons per move (5 moves)
+parser.add_argument("--mc_pop", type=int, default=100)
 parser.add_argument("--ac_mc_sparsity", type=float, default=0.40)
-parser.add_argument("--ac_mc_init", type=float, default=0.3)  # U(0, init) per synapse
+parser.add_argument("--ac_mc_init", type=float, default=0.3)  
 parser.add_argument("--w_max", type=float, default=1.0)
-# nu must be scaled with --w_max: MSTDPET updates once per SIMULATION step, i.e.
-# --granularity times per decision, so a large nu pins every weight at the cap
-# within one episode -- which looks exactly like "weights not changing".
 parser.add_argument("--nu", type=float, default=4e-3)
-
-# --- action selection (paper: WTA + epsilon-greedy) ---
-parser.add_argument("--select", type=str, default="wta", choices=["wta", "softmax"])
-parser.add_argument("--eps_start", type=float, default=1.0)
-parser.add_argument("--eps_decay", type=float, default=0.99)   # per step, as in paper
-parser.add_argument("--eps_min", type=float, default=0.05)
 
 parser.add_argument("--diagnose", type=bool, default=True)
 parser.add_argument("--diag_stride", type=int, default=4)   # probe positions
@@ -189,43 +169,15 @@ LAYER_AC, LAYER_MC = "AC", "MC"
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
 
-def getLocalView(obs, row, col, view_r):
-    """
-    UNUSED by the two-stream encoder -- kept for reference and for any pixel-based
-    variant you want to add back. Visibility gating now uses Chebyshev distance,
-    which is exactly the condition "this cell falls inside the patch below".
-    """
-    padded = np.pad(obs, view_r, mode="constant", constant_values=0)
-    patch = padded[row: row + 2 * view_r + 1, col: col + 2 * view_r + 1]
-    flat = patch.flatten()
-    center = view_r * (2 * view_r + 1) + view_r
-    return np.concatenate([flat[:center], flat[center + 1:]])
-
-
-def gcRates(view_vec, W_grid, peak, max_rate):
-    """view (inpt_n,) -> grid-cell firing rates (n_gc,). Paper: f = p/p_max * f_max."""
-    drive = view_vec @ W_grid                            # (n_gc,)
-    drive = (drive / peak.squeeze(0)).clamp(min=0.0, max=1.0)
-    drive[drive < 0.01] = 0.0
-    return drive * max_rate
-
 # select action based on the largest spiking population
-def wtaAction(mc_spikes, n_actions, eps, rng):
+def wtaAction(mc_spikes, n_actions, rng):
     """mc_spikes: (time, n_mc) -> action index. Aggregate count per subpopulation."""
-    if rng.random() < eps:
-        return int(rng.integers(0, n_actions))
     counts = mc_spikes.sum(0)
     pops = torch.chunk(counts, n_actions)
     agg = torch.stack([p.sum() for p in pops])
     if agg.max() == 0:
         return int(rng.integers(0, n_actions))
     return int(torch.argmax(agg).item())
-
-def softmaxAction(mc_spikes, n_actions):
-    counts = mc_spikes.sum(0)
-    agg = torch.stack([p.sum() for p in torch.chunk(counts, n_actions)])
-    return int(torch.multinomial(torch.softmax(agg, dim=0), 1).item())
-
 
 # TRAINING LOOP
 # todo: reward is currently more sparse but the reward still needs
@@ -234,13 +186,12 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
                  feat_ac_mc, gran=100, rfname="", pfname="",
                  weight_features=None, render_replays=False, render_every=25,
                  replay_fps=20, replay_prefix="replay", view_r=14,
-                 learning=True, eps_start=1.0, dim=28):
+                 dim=28):
     dt = net.dt
     peak_v = peak.squeeze(0)                       # (n_gc,) hoisted out of the loop
     zero_gc = torch.zeros(W_grid.shape[1], device=DEVICE)
     rng = np.random.default_rng(args.seed)
     spike_ims = spike_axes = None
-    eps = eps_start if learning else 0.0
 
     for ep in range(episodes):
         total_reward, intercepts, step = 0.0, 0, 0
@@ -357,11 +308,7 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
             mc_frac_sum += (mc.sum(0) > 0).float().mean().item()
 
             # get the action from the most active motor cell population
-            action = (wtaAction(mc, env.action_space.n, eps, rng)
-                      if args.select == "wta"
-                      else softmaxAction(mc, env.action_space.n))
-            if learning:
-                eps = max(args.eps_min, eps * args.eps_decay)
+            action = wtaAction(mc, env.action_space.n, rng)
 
             rewards[step - 1] = r
             total_reward += r
@@ -403,7 +350,7 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
 
             if step % 25 == 0:
                 print(f"  step {step} ({time.time() - clock:.2f}s) "
-                      f"r={r:+.3f} eps={eps:.3f}")
+                      f"r={r:+.3f}")
                 clock = time.time()
 
         if net.reward_fn is not None:
@@ -411,7 +358,7 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
 
         # plotting + diagnostics code
         print(f"Episode {ep}: total reward {total_reward:.2f}"
-              f"intercepts {intercepts}, eps {eps:.3f} | "
+              f"intercepts {intercepts} "
               f"target visible {visible_steps / max(1, step):.0%} | "
               f"AC active {ac_frac_sum / max(1, step):.1%}, "
               f"MC active {mc_frac_sum / max(1, step):.1%} | ")
@@ -447,7 +394,6 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
         if ep % args.fcycle == 0:
             env.cycleOutFiles()
 
-    return eps
 
 # --------------------------------------------------------------------------- #
 def main():
@@ -601,9 +547,13 @@ def main():
     # to some AC. Fan-in is 2 * n_pc, and the 1/sqrt(fan-in) scaling keeps
     # --pc_ac_gain meaningful if you change --n_pc or --ac.
     dense_fan = float(2 * args.n_pc)
-    W_pc_ac_a = (torch.rand(args.n_pc, args.ac, device=DEVICE)
+    pc_ac_a_mask = (torch.rand(args.n_pc, args.ac) 
+                    <= args.pc_ac_sparsity).float().to(DEVICE)
+    W_pc_ac_a = (pc_ac_a_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
                  / np.sqrt(dense_fan)) * args.pc_ac_gain
-    W_pc_ac_t = (torch.rand(args.n_pc, args.ac, device=DEVICE)
+    pc_ac_t_mask = (torch.rand(args.n_pc, args.ac) 
+                        <= args.pc_ac_sparsity).float().to(DEVICE)
+    W_pc_ac_t = (pc_ac_t_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
                  / np.sqrt(dense_fan)) * args.pc_ac_gain
 
     feat_pc_ac_a = Weight(name="w_pc_ac_a", value=W_pc_ac_a)
@@ -697,7 +647,6 @@ def main():
         weight_features=weight_features, render_replays=args.render_replays,
         render_every=args.render_every, replay_fps=args.replay_fps,
         replay_prefix="replay_train", view_r=args.view_r, dim=dim,
-        learning=True, eps_start=args.eps_start,
     )
     net.learning = False
  
@@ -717,7 +666,6 @@ def main():
         weight_features=weight_features, render_replays=args.render_replays,
         render_every=args.render_every, replay_fps=args.replay_fps,
         replay_prefix="replay_test", view_r=args.view_r, dim=dim,
-        learning=False, eps_start=0.0,
     )
 
 def probeStimulus(inpt_n, side, centre_flat, cell, trail=(1.0, 0.75, 0.5, 0.25)):
@@ -1003,10 +951,10 @@ def plotMotorWeightPolar(w_ac_mc, active_mask, ep, out_path=OUT_FILE_PATH):
     return fname
 
 def rasterSubsample(spk, max_n):
-    """(time, n) -> (time, <=max_n). Evenly spaced neuron subset, chosen so the
-    subset does not bias toward low indices. max_n <= 0 means keep every neuron."""
+    """(time, n) -> (time, <=max_n). Evenly spaced neuron subset, so a 1000-cell
+    AC layer stays legible and cheap to draw without biasing toward low indices."""
     n = spk.shape[1]
-    if max_n <= 0 or n <= max_n:
+    if n <= max_n:
         return spk
     idx = torch.linspace(0, n - 1, max_n, device=spk.device).long()
     return spk[:, idx]
@@ -1028,7 +976,7 @@ def styleRasterAxes(axes, layers, gran, sizes, first_call=False):
     if first_call:
         axes[0].figure.subplots_adjust(top=0.86, bottom=0.13, hspace=0.6)
 
-def plotRasterTimeline(windows, layers, gran, ep, fname, max_points=None):
+def plotRasterTimeline(windows, layers, gran, ep, fname, max_points=60000):
     """
     Whole-episode spike raster: every decision window concatenated along x, with a
     dashed line at each decision boundary. This is the "timeline" view -- the GIF
@@ -1038,10 +986,8 @@ def plotRasterTimeline(windows, layers, gran, ep, fname, max_points=None):
     """
     if not windows:
         return None
-    max_points = args.raster_timeline_points if max_points is None else max_points
     fig, axes = plt.subplots(len(layers), 1, sharex=True,
-                             figsize=(max(8.0, 0.09 * len(windows)),
-                                      args.raster_panel_h * len(layers)))
+                             figsize=(max(8.0, 0.09 * len(windows) * 1.0), 2.2 * len(layers)))
     if len(layers) == 1:
         axes = [axes]
     for ax, layer in zip(axes, layers):
