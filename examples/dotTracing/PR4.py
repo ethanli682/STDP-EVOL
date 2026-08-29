@@ -70,7 +70,7 @@ from bindsnet.network import Network
 from bindsnet.network.monitors import Monitor
 from bindsnet.network.nodes import Input, LIFNodes
 from bindsnet.network.topology import MulticompartmentConnection
-from bindsnet.network.topology_features import Weight
+from bindsnet.network.topology_features import Weight, Mask
 
 # --------------------------------------------------------------------------- #
 # Arguments
@@ -111,7 +111,16 @@ parser.add_argument("--raster_replays", type=bool, default=True)
 parser.add_argument("--raster_timeline", type=bool, default=True)
 parser.add_argument("--raster_layers", type=str, nargs="+",
                     default=["PC_A", "PC_T", "AC", "MC"])
-parser.add_argument("--raster_max_neurons", type=int, default=200)
+# 0 (the default) plots EVERY neuron in the layer. Set a positive number to draw
+# an evenly spaced subsample instead, which is only worth doing if the figures get
+# too slow -- spike counts, not neuron counts, drive the cost.
+parser.add_argument("--raster_max_neurons", type=int, default=0)
+# Point cap for the episode-timeline PNG. Above this the scatter is thinned and
+# the panel is labelled "(thinned)", so a dense raster stays honest about it.
+parser.add_argument("--raster_timeline_points", type=int, default=400000)
+# Height in inches PER PANEL. With every neuron shown, the plot_spikes default of
+# 4.5in total makes a 1000-cell layer an unreadable smear.
+parser.add_argument("--raster_panel_h", type=float, default=2.0)
 
 # --- GC layer (paper: 5 scales x 7 rotations x 16 offsets = 560) ---
 parser.add_argument("--gc_scales", type=int, nargs="+", default=[5, 7, 11, 13, 17])
@@ -171,7 +180,7 @@ args = parser.parse_args()
 
 moveChoices = 9 if args.diag else 5
 DEVICE = torch.device("cuda" if (torch.cuda.is_available() and args.gpu) else "cpu")
-OUT_FILE_PATH = "PR2_RUN_raster_incl/"
+OUT_FILE_PATH = "PR4_RUN_raster_incl/"
 
 LAYER_GCA, LAYER_GCT = "GC_A", "GC_T"      # grid code at agent / at target
 LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
@@ -221,7 +230,7 @@ def softmaxAction(mc_spikes, n_actions):
 # TRAINING LOOP
 # todo: reward is currently more sparse but the reward still needs
 # to serve as an indicator
-def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
+def runSimulator(net, env, spikes, episodes, W_grid, peak,
                  feat_ac_mc, gran=100, rfname="", pfname="",
                  weight_features=None, render_replays=False, render_every=25,
                  replay_fps=20, replay_prefix="replay", view_r=14,
@@ -245,19 +254,18 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
         replay_frames = []
         raster_frames, raster_windows = [], []
         raster_ims = raster_axes = raster_fig = None
-        raster_sizes = {l: min(net.layers[l].n, args.raster_max_neurons)
+        raster_sizes = {l: (net.layers[l].n if args.raster_max_neurons <= 0
+                            else min(net.layers[l].n, args.raster_max_neurons))
                         for l in args.raster_layers}
         if capturing:
             env.render()          # pins plt.gcf() as the env figure on ep 0
             replay_frames.append(captureFrame())
             if args.raster_replays:
-                blank = {
-                    l: torch.zeros(gran,
-                                   min(net.layers[l].n, args.raster_max_neurons))
-                    for l in args.raster_layers
-                }
-                raster_ims, raster_axes = plot_spikes(blank, ims=raster_ims,
-                                                      axes=raster_axes)
+                blank = {l: torch.zeros(gran, raster_sizes[l])
+                         for l in args.raster_layers}
+                raster_ims, raster_axes = plot_spikes(
+                    blank, ims=raster_ims, axes=raster_axes,
+                    figsize=(8.0, args.raster_panel_h * len(args.raster_layers)))
                 raster_fig = plt.gcf()
                 styleRasterAxes(raster_axes, args.raster_layers, gran,
                                 raster_sizes, first_call=True)
@@ -273,13 +281,6 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
         w0 = feat_ac_mc.value.detach().clone()
         ac_frac_sum, mc_frac_sum = 0.0, 0.0
 
-
-
-        # todo00: the ego centric view represents what should be spiking and what shouldnt
-        # whatever is inside the view: the agent's position should always indicate where the agent is
-        # if the target is inside the view: the target's position should spike
-        # connect the different layers densely to a reasoning layer
-        # the reasoning layer connects to the motor cortex
         while not done:
             step += 1
 
@@ -292,9 +293,9 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
 
             net_obs = obs.copy()
 
-            # agent row+col
+            # agent row+col after the step
             cr, cc = env.netDot.row[0], env.netDot.col[0]
-            # target row+col
+            # target row+col after the step
             tr, tc = env.dots[0].row[0], env.dots[0].col[0]
 
             # calc change in dist
@@ -330,10 +331,7 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
             a_drive = torch.where(a_drive < 0.01, zero_gc, a_drive)
             rates_a = a_drive * args.gc_max_rate
 
-            # Target stream: GATED BY THE EGOCENTRIC WINDOW. Chebyshev distance
-            # <= view_r is exactly "the target falls inside the (2r+1)^2 patch
-            # getLocalView would cut". Outside it the agent cannot see the
-            # target, so the target grid cells emit nothing and PC_T goes quiet.
+            # check if target is outside of the viewing radius of the agent
             visible = (abs(int(tr) - int(cr)) <= view_r and
                        abs(int(tc) - int(cc)) <= view_r)
             if visible:
@@ -352,17 +350,13 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
             # run network with gridcell firing as input to get a move choice
             net.run(inputs=inputs, time=gran, reward=reward)
 
-            # TODO: ADD MASK OBJ
-            if learning:
-                with torch.no_grad():
-                    feat_ac_mc.value.mul_(ac_mc_mask).clamp_(0.0, args.w_max)
-
             mc = spikes[LAYER_MC].get("s").squeeze()          # (time, n_mc)
             ac = spikes[LAYER_AC].get("s").squeeze()
             last_active_ac = (ac.sum(0) >= 4).float()
             ac_frac_sum += last_active_ac.mean().item()
             mc_frac_sum += (mc.sum(0) > 0).float().mean().item()
 
+            # get the action from the most active motor cell population
             action = (wtaAction(mc, env.action_space.n, eps, rng)
                       if args.select == "wta"
                       else softmaxAction(mc, env.action_space.n))
@@ -415,24 +409,13 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
         if net.reward_fn is not None:
             net.reward_fn.update(accumulated_reward=total_reward, steps=step)
 
-        w_now = feat_ac_mc.value.detach()
-        dw = (w_now - w0).abs()
-        live = ac_mc_mask.bool()
-        pinned = ((w_now[live] >= args.w_max - 1e-6) |
-                  (w_now[live] <= 1e-6)).float().mean().item()
-        print(f"Episode {ep}: total reward {total_reward:.2f}, "
+        # plotting + diagnostics code
+        print(f"Episode {ep}: total reward {total_reward:.2f}"
               f"intercepts {intercepts}, eps {eps:.3f} | "
               f"target visible {visible_steps / max(1, step):.0%} | "
               f"AC active {ac_frac_sum / max(1, step):.1%}, "
-              f"MC active {mc_frac_sum / max(1, step):.1%} | "
-              f"|dW_ac_mc| mean {dw.mean():.2e} max {dw.max():.2e}, "
-              f"{pinned:.0%} of live synapses at a bound")
-        if pinned > 0.9:
-            print("  !! AC->MC is pinned at its bounds: lower --nu or raise "
-                  "--w_max. A saturated weight matrix cannot express a policy "
-                  "and will look frozen on the weight plots.")
+              f"MC active {mc_frac_sum / max(1, step):.1%} | ")
         os.makedirs(OUT_FILE_PATH, exist_ok=True)
-
         if capturing and replay_frames:
             saveReplayGIF(replay_frames,
                           os.path.join(OUT_FILE_PATH,
@@ -452,11 +435,9 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak, ac_mc_mask,
                              f"{replay_prefix}_rastertl_ep{ep:05d}.png"))
         if capturing and raster_fig is not None:
             plt.close(raster_fig)
-
         if weight_features is not None and ep % render_every == 0:
             plotWeightGraphs(weight_features, ep)
             plotMotorWeightPolar(feat_ac_mc.value, last_active_ac, ep)
-
         if args.write and rfname:
             with open(rfname, "ab") as f:
                 np.savetxt(f, rewards, delimiter=",", fmt="%.6f")
@@ -658,16 +639,18 @@ def main():
         source=LAYER_AC, target=LAYER_AC)
 
     ac_mc_gen = torch.Generator(device="cpu").manual_seed(args.seed + 1)
-    ac_mc_mask = (torch.rand(args.ac, n_mc, generator=ac_mc_gen)
-                  < 0.40).float().to(DEVICE) # 40% sparsity for ac->mc
+    ac_mc_mask_gen = (torch.rand(args.ac, n_mc, generator=ac_mc_gen)
+                  < 0.40).to(DEVICE) # 40% sparsity for ac->mc
+
+    ac_mc_mask = Mask(name='ac_mc_mask',value=ac_mc_mask_gen)
  
-    W_ac_mc = ac_mc_mask * torch.rand(args.ac, n_mc, device=DEVICE) * args.ac_mc_init
+    W_ac_mc = ac_mc_mask_gen * torch.rand(args.ac, n_mc, device=DEVICE) * args.ac_mc_init
  
     feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc,
                         learning_rule=MSTDPET, nu=[args.nu, args.nu])
     net.add_connection(
         MulticompartmentConnection(source=ac, target=mc,
-                                   pipeline=[feat_ac_mc], device=DEVICE),
+                                   pipeline=[feat_ac_mc,ac_mc_mask], device=DEVICE),
         source=LAYER_AC, target=LAYER_MC)
 
     net.to(DEVICE)
@@ -708,7 +691,7 @@ def main():
     print("Training:")
     environment.addFileSuffix("train")
     runSimulator(
-        net, environment, spikes, args.trn_eps, W_grid, peak, ac_mc_mask,
+        net, environment, spikes, args.trn_eps, W_grid, peak,
         feat_ac_mc, gran=args.granularity,
         rfname=genFileName("rew", "train"), pfname=genFileName("perf", "train"),
         weight_features=weight_features, render_replays=args.render_replays,
@@ -728,7 +711,7 @@ def main():
     print("Testing:")
     environment.changeFileSuffix("train", "test")
     runSimulator(
-        net, environment, spikes, args.tst_eps, W_grid, peak, ac_mc_mask,
+        net, environment, spikes, args.tst_eps, W_grid, peak,
         feat_ac_mc, gran=args.granularity,
         rfname=genFileName("rew", "test"), pfname=genFileName("perf", "test"),
         weight_features=weight_features, render_replays=args.render_replays,
@@ -1020,10 +1003,10 @@ def plotMotorWeightPolar(w_ac_mc, active_mask, ep, out_path=OUT_FILE_PATH):
     return fname
 
 def rasterSubsample(spk, max_n):
-    """(time, n) -> (time, <=max_n). Evenly spaced neuron subset, so a 1000-cell
-    AC layer stays legible and cheap to draw without biasing toward low indices."""
+    """(time, n) -> (time, <=max_n). Evenly spaced neuron subset, chosen so the
+    subset does not bias toward low indices. max_n <= 0 means keep every neuron."""
     n = spk.shape[1]
-    if n <= max_n:
+    if max_n <= 0 or n <= max_n:
         return spk
     idx = torch.linspace(0, n - 1, max_n, device=spk.device).long()
     return spk[:, idx]
@@ -1045,7 +1028,7 @@ def styleRasterAxes(axes, layers, gran, sizes, first_call=False):
     if first_call:
         axes[0].figure.subplots_adjust(top=0.86, bottom=0.13, hspace=0.6)
 
-def plotRasterTimeline(windows, layers, gran, ep, fname, max_points=60000):
+def plotRasterTimeline(windows, layers, gran, ep, fname, max_points=None):
     """
     Whole-episode spike raster: every decision window concatenated along x, with a
     dashed line at each decision boundary. This is the "timeline" view -- the GIF
@@ -1055,8 +1038,10 @@ def plotRasterTimeline(windows, layers, gran, ep, fname, max_points=60000):
     """
     if not windows:
         return None
+    max_points = args.raster_timeline_points if max_points is None else max_points
     fig, axes = plt.subplots(len(layers), 1, sharex=True,
-                             figsize=(max(8.0, 0.09 * len(windows) * 1.0), 2.2 * len(layers)))
+                             figsize=(max(8.0, 0.09 * len(windows)),
+                                      args.raster_panel_h * len(layers)))
     if len(layers) == 1:
         axes = [axes]
     for ax, layer in zip(axes, layers):

@@ -9,4 +9,4 @@
 source /cluster/home/eli08/miniconda3/etc/profile.d/conda.sh
 conda activate Para-HADES
 
-python PR2.py 
+python PR4.py 
