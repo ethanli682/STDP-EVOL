@@ -45,7 +45,6 @@ well below 0.6. --diagnose prints all of these before training starts.
 """
 
 from ast import arg
-from email.policy import default
 
 import matplotlib
 matplotlib.use("Agg")
@@ -94,23 +93,25 @@ parser.add_argument("--write", type=bool, default=False)
 parser.add_argument("--fcycle", type=int, default=100)
 parser.add_argument("--gpu", type=bool, default=True)
 parser.add_argument("--view_r", type=int, default=14)
-parser.add_argument("--make_sparse", type=bool, default=True)
+parser.add_argument("--make_sparse", type=bool, default=False)
 
-# rendering (now actually gated -- the old script captured every frame of every episode)
+# rendering 
 parser.add_argument("--render_replays", type=bool, default=True)
 parser.add_argument("--render_every", type=int, default=10)
 parser.add_argument("--replay_fps", type=int, default=20)
 parser.add_argument("--plot_every", type=int, default=50)
 # Raster replays: for every episode that gets an env GIF, also emit a spike-raster
-# GIF with one frame per decision (same frame count and fps, so the two play in
-# lockstep) plus a whole-episode raster timeline PNG.
+# GIF with one frame per decision, plus a whole-episode raster timeline PNG.
 parser.add_argument("--raster_replays", type=bool, default=True)
 parser.add_argument("--raster_timeline", type=bool, default=True)
 parser.add_argument("--raster_layers", type=str, nargs="+",
                     default=["PC_A", "PC_T", "AC", "MC"])
-parser.add_argument("--raster_max_neurons", type=int, default=200)
+# 0 (the default) plots EVERY neuron in the layer. A positive value draws an
+# evenly spaced subsample instead. Spike counts, not neuron counts, drive the
+# drawing cost, so plotting all of them is cheap.
+parser.add_argument("--raster_max_neurons", type=int, default=0)
 
-# --- GC layer (paper: 5 scales x 7 rotations x 16 offsets = 560) ---
+# GC layer 
 parser.add_argument("--gc_scales", type=int, nargs="+", default=[5, 7, 11, 13, 17])
 parser.add_argument("--gc_rotations", type=int, default=7)
 parser.add_argument("--gc_offsets", type=int, default=16)   # 4x4 phase grid
@@ -118,16 +119,10 @@ parser.add_argument("--gc_global_scale", type=float, default=1.0)  # paper's g
 parser.add_argument("--gc_sharpness", type=float, default=1.0)     # paper's k
 parser.add_argument("--gc_max_rate", type=float, default=80.0)     # 8 spikes / 100 ms
 
-# --- PLACE CELL layers: one for the agent, one for the target -------------
-# Each is the paper's GC->AC transform: sparse frozen projection from a
-# world-tiled grid code into coincidence-detecting LIF cells, giving sparse
-# place-field-like responses. PC_A reads the grid code at the AGENT's board
-# square (always driven -- the agent is always somewhere). PC_T reads it at the
-# TARGET's board square, but only when the target falls inside the agent's
-# egocentric window; outside it, PC_T receives nothing and falls silent.
+# PLACE CELL layers: one for the agent, one for the target
 parser.add_argument("--n_pc", type=int, default=500)          # per place layer
-parser.add_argument("--gc_pc_sparsity", type=float, default=0.05)
-parser.add_argument("--gc_pc_gain", type=float, default=25.0)  # GC -> PC (sparse)
+parser.add_argument("--gc_pc_sparsity", type=float, default=0.05) 
+parser.add_argument("--gc_pc_gain", type=float, default=25.0) 
 parser.add_argument("--pc_lbound", type=float, default=-80.0)
 
 # ASSOCIATION layer 
@@ -140,6 +135,7 @@ parser.add_argument("--ac_lbound", type=float, default=-80.0)
 parser.add_argument("--rec_mode", type=str, default="random",
                     choices=["random", "local"])
 
+# RECURRENT connection
 parser.add_argument("--rec_exc", type=float, default=15.0)
 parser.add_argument("--rec_inh", type=float, default=25.0)
 parser.add_argument("--rec_radius", type=float, default=4.0)
@@ -160,7 +156,7 @@ args = parser.parse_args()
 
 moveChoices = 9 if args.diag else 5
 DEVICE = torch.device("cuda" if (torch.cuda.is_available() and args.gpu) else "cpu")
-OUT_FILE_PATH = "PR4_RUN_raster_incl/"
+OUT_FILE_PATH = "PR4_RUN_TEST1/"
 
 LAYER_GCA, LAYER_GCT = "GC_A", "GC_T"      # grid code at agent / at target
 LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
@@ -215,8 +211,7 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
                 blank = {l: torch.zeros(gran, raster_sizes[l])
                          for l in args.raster_layers}
                 raster_ims, raster_axes = plot_spikes(
-                    blank, ims=raster_ims, axes=raster_axes,
-                    figsize=(8.0, args.raster_panel_h * len(args.raster_layers)))
+                    blank, ims=raster_ims, axes=raster_axes, figsize=(8,12))
                 raster_fig = plt.gcf()
                 styleRasterAxes(raster_axes, args.raster_layers, gran,
                                 raster_sizes, first_call=True)
@@ -227,9 +222,6 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
         action = int(rng.integers(0, env.action_space.n))
         last_active_ac = torch.zeros(net.layers[LAYER_AC].n, device=DEVICE)
         clock = time.time()
-        # Per-episode health counters: if ac_frac is ~0 the plastic AC->MC weights
-        # cannot move, so w_delta being ~0 is a symptom, not the disease.
-        w0 = feat_ac_mc.value.detach().clone()
         ac_frac_sum, mc_frac_sum = 0.0, 0.0
 
         while not done:
@@ -242,8 +234,6 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
             # take a step
             obs, _, done, intercept = env.step(action)
 
-            net_obs = obs.copy()
-
             # agent row+col after the step
             cr, cc = env.netDot.row[0], env.netDot.col[0]
             # target row+col after the step
@@ -251,35 +241,31 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
 
             # calc change in dist
             curr_dist = np.hypot(cr - tr, cc - tc)
-            delta = prev_dist - curr_dist
+            r = prev_dist - curr_dist
 
             # calculate alignment based on dot product
-            dr_p, dc_p = tr - pr, tc - pc
-            dr_m, dc_m = cr - pr, cc - pc
-            dmag, mmag = np.hypot(dr_p, dc_p), np.hypot(dr_m, dc_m)
+            # dr_p, dc_p = tr - pr, tc - pc
+            # dr_m, dc_m = cr - pr, cc - pc
+            # dmag, mmag = np.hypot(dr_p, dc_p), np.hypot(dr_m, dc_m)
 
-            alignment = 0.0 if (mmag < 1e-8 or dmag < 1e-8) else \
-                float(np.clip((dr_m * dr_p + dc_m * dc_p) / (dmag * mmag), -1, 1))
-            scale = 0.5 + 0.5 * alignment
-            r = delta * ((0.5 + scale) if delta >= 0 else (1.5 - scale))
-            r += 0.2 * alignment
+            # alignment = 0.0 if (mmag < 1e-8 or dmag < 1e-8) else \
+            #     float(np.clip((dr_m * dr_p + dc_m * dc_p) / (dmag * mmag), -1, 1))
+            # scale = 0.5 + 0.5 * alignment
+            # r = delta * ((0.5 + scale) if delta >= 0 else (1.5 - scale))
+            # r += 0.2 * alignment
 
             if intercept:
-                r += 20.0
+                r += 10.0
             # decrease reward over time
             if args.make_sparse: 
                 r *= (ep/episodes+0.5)
             reward = torch.tensor(r, dtype=torch.float32, device=DEVICE)
 
-            # ---- TWO GRID QUERIES AGAINST ONE WORLD-TILED LATTICE ------------
             # W_grid is (n_world, n_gc): row k is the grid-cell population code
             # for board square k. Because the lattice is anchored to the WORLD,
             # reading a position is a row lookup, not a matrix product.
-            #
-            # Agent stream: always driven. The agent is always on the board, so
-            # PC_A always has something to represent.
             a_drive = (W_grid[int(cr) * dim + int(cc)] / peak_v).clamp(0.0, 1.0)
-            a_drive = torch.where(a_drive < 0.01, zero_gc, a_drive)
+            a_drive = torch.where(a_drive < 0.01, zero_gc, a_drive) # remove gaussian tail
             rates_a = a_drive * args.gc_max_rate
 
             # check if target is outside of the viewing radius of the agent
@@ -326,7 +312,8 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
                         raster_windows.append(window)
                     if args.raster_replays:
                         raster_ims, raster_axes = plot_spikes(
-                            window, ims=raster_ims, axes=raster_axes)
+                            window, ims=raster_ims, axes=raster_axes,
+                            figsize=(8,12))
                         if raster_fig is None:
                             raster_fig = plt.gcf()
                             styleRasterAxes(raster_axes, args.raster_layers, gran,
@@ -449,38 +436,18 @@ def main():
     W_grid_np = np.stack(gc_fields, axis=1)       
     peak_np = W_grid_np.max(axis=0, keepdims=True)
     peak_np[peak_np == 0] = 1.0
-    # this weights grid is the weigths of the grid cells, 
-    # which is passed into the simulator
+    # this weights grid is the weigths of the grid cells, which is 
+    # passed into the simulator
     # grid cell weights are from the gaussians
     W_grid = torch.from_numpy(W_grid_np).to(DEVICE)
     peak = torch.from_numpy(peak_np).to(DEVICE)
     n_gc = W_grid.shape[1]
 
-
-    # ======================================================================= #
-    # NETWORK:   GC_A -> PC_A  \
-    #                            >-- (dense) --> AC -> MC
-    #            GC_T -> PC_T  /
-    #
-    # One world-tiled grid lattice (W_grid above), queried at two positions.
-    # GC_A carries the code for the agent's square and is always driven.
-    # GC_T carries the code for the target's square and is gated to silence
-    # whenever the target sits outside the agent's egocentric window.
-    # Each grid stream feeds its own place-cell layer through a SPARSE FROZEN
-    # projection -- this is the paper's GC->AC transform, which turns an
-    # ambiguous periodic code into sparse, position-selective responses.
-    # The two place layers then converge DENSELY on the association layer,
-    # which is the only place agent-position and target-position information
-    # can be combined. AC->MC stays the sole plastic pathway, as in the paper.
-    # ======================================================================= #
     net = Network(dt=args.dt)
 
     gc_a = Input(n=n_gc, shape=[1, 1, 1, 1, n_gc], traces=True)
     gc_t = Input(n=n_gc, shape=[1, 1, 1, 1, n_gc], traces=True)
 
-    # Place cells: coincidence detectors. rest -64 / thresh -45 leaves a 19 mV
-    # gap and tc_decay 20 ms leaks it away fast, so a PC only fires when several
-    # of its afferent grid cells spike close together in time.
     # agent place cells
     pc_a = LIFNodes(n=args.n_pc, traces=True,
                     rest=-64.0, reset=-70.0, thresh=-45.0,
@@ -509,11 +476,7 @@ def main():
     net.add_layer(ac,   name=LAYER_AC)
     net.add_layer(mc,   name=LAYER_MC)
 
-    # ---- GC -> PC : sparse, frozen, excitatory ---------------------------- #
-    # Separate generator seeds so the two place layers get DIFFERENT random
-    # samples of the grid population. Identical masks would make PC_A and PC_T
-    # mirror images, and the AC layer could not tell the two streams apart from
-    # their firing patterns alone.
+    # grid cell to place cell connections
     # 5% sparsity
     gen_a = torch.Generator(device="cpu").manual_seed(args.seed + 10)
     gc_pc_mask_a = (torch.rand(n_gc, args.n_pc, generator=gen_a)
@@ -541,17 +504,13 @@ def main():
                                    pipeline=[feat_gc_pc_t], device=DEVICE),
         source=LAYER_GCT, target=LAYER_PCT)
 
-    # ---- PC -> AC : DENSE, frozen ----------------------------------------- #
-    # No mask. Every place cell in both layers projects to every association
-    # cell, so any (agent-square, target-square) pair is in principle available
-    # to some AC. Fan-in is 2 * n_pc, and the 1/sqrt(fan-in) scaling keeps
-    # --pc_ac_gain meaningful if you change --n_pc or --ac.
+    # PLACE to ASSOCIATION connection
     dense_fan = float(2 * args.n_pc)
-    pc_ac_a_mask = (torch.rand(args.n_pc, args.ac) 
+    pc_ac_a_mask = (torch.rand(args.n_pc, args.ac, generator=gen_a) 
                     <= args.pc_ac_sparsity).float().to(DEVICE)
     W_pc_ac_a = (pc_ac_a_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
                  / np.sqrt(dense_fan)) * args.pc_ac_gain
-    pc_ac_t_mask = (torch.rand(args.n_pc, args.ac) 
+    pc_ac_t_mask = (torch.rand(args.n_pc, args.ac, generator=gen_t) 
                         <= args.pc_ac_sparsity).float().to(DEVICE)
     W_pc_ac_t = (pc_ac_t_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
                  / np.sqrt(dense_fan)) * args.pc_ac_gain
@@ -951,10 +910,10 @@ def plotMotorWeightPolar(w_ac_mc, active_mask, ep, out_path=OUT_FILE_PATH):
     return fname
 
 def rasterSubsample(spk, max_n):
-    """(time, n) -> (time, <=max_n). Evenly spaced neuron subset, so a 1000-cell
-    AC layer stays legible and cheap to draw without biasing toward low indices."""
+    """(time, n) -> (time, <=max_n). Evenly spaced neuron subset, chosen so it does
+    not bias toward low indices. max_n <= 0 means keep every neuron."""
     n = spk.shape[1]
-    if n <= max_n:
+    if max_n <= 0 or n <= max_n:
         return spk
     idx = torch.linspace(0, n - 1, max_n, device=spk.device).long()
     return spk[:, idx]
@@ -976,7 +935,7 @@ def styleRasterAxes(axes, layers, gran, sizes, first_call=False):
     if first_call:
         axes[0].figure.subplots_adjust(top=0.86, bottom=0.13, hspace=0.6)
 
-def plotRasterTimeline(windows, layers, gran, ep, fname, max_points=60000):
+def plotRasterTimeline(windows, layers, gran, ep, fname, max_points=400000):
     """
     Whole-episode spike raster: every decision window concatenated along x, with a
     dashed line at each decision boundary. This is the "timeline" view -- the GIF
