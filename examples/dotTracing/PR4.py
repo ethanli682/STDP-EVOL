@@ -136,8 +136,7 @@ parser.add_argument("--rec_mode", type=str, default="random",
                     choices=["random", "local"])
 
 # RECURRENT connection
-parser.add_argument("--rec_exc", type=float, default=15.0)
-parser.add_argument("--rec_inh", type=float, default=25.0)
+parser.add_argument("--rec_scaler", type=float, default=5.0)
 parser.add_argument("--rec_radius", type=float, default=4.0)
 parser.add_argument("--ac_target_sparsity", type=float, default=0.10)
 
@@ -156,7 +155,7 @@ args = parser.parse_args()
 
 moveChoices = 9 if args.diag else 5
 DEVICE = torch.device("cuda" if (torch.cuda.is_available() and args.gpu) else "cpu")
-OUT_FILE_PATH = "PR4_RUN_TEST1/"
+OUT_FILE_PATH = "PR4_RUN_TEST3/"
 
 LAYER_GCA, LAYER_GCT = "GC_A", "GC_T"      # grid code at agent / at target
 LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
@@ -450,12 +449,12 @@ def main():
 
     # agent place cells
     pc_a = LIFNodes(n=args.n_pc, traces=True,
-                    rest=-64.0, reset=-70.0, thresh=-45.0,
+                    rest=-64.0, reset=-70.0, thresh=-25.0,
                     refrac=1, tc_decay=20.0, tc_trace=20.0,
                     lbound=args.pc_lbound)
     # target place cells
     pc_t = LIFNodes(n=args.n_pc, traces=True,
-                    rest=-64.0, reset=-70.0, thresh=-45.0,
+                    rest=-64.0, reset=-70.0, thresh=-25.0,
                     refrac=1, tc_decay=20.0, tc_trace=20.0,
                     lbound=args.pc_lbound)
 
@@ -504,7 +503,7 @@ def main():
                                    pipeline=[feat_gc_pc_t], device=DEVICE),
         source=LAYER_GCT, target=LAYER_PCT)
 
-    # PLACE to ASSOCIATION connection
+    # PLACE to ASSOCIATION connection 10% sparsity
     dense_fan = float(2 * args.n_pc)
     pc_ac_a_mask = (torch.rand(args.n_pc, args.ac, generator=gen_a) 
                     <= args.pc_ac_sparsity).float().to(DEVICE)
@@ -527,19 +526,13 @@ def main():
                                    pipeline=[feat_pc_ac_t], device=DEVICE),
         source=LAYER_PCT, target=LAYER_AC)
 
-    # ---- AC -> AC : recurrence (not in the paper; the target moves) -------- #
-    # Column-normalised excitatory and inhibitory budgets in mV, so the totals
-    # do not scale with --ac. Without this the raw Mexican hat summed to
-    # hundreds of mV of inhibition per cell and no feedforward gain could move
-    # the layer.
+    # Recurrent association layer connection reservoir, no learning done
     rec_gen = torch.Generator(device="cpu").manual_seed(args.seed)
     mag = torch.rand(args.ac, args.ac, generator=rec_gen)
     pos_m = (torch.rand(args.ac, args.ac, generator=rec_gen) < 0.45).float()
-    E, I = mag * pos_m, mag * (1.0 - pos_m)
-    E.fill_diagonal_(0.0); I.fill_diagonal_(0.0)
-    E = E / E.sum(0, keepdim=True).clamp(min=1e-6) * args.rec_exc
-    I = I / I.sum(0, keepdim=True).clamp(min=1e-6) * args.rec_inh
-    W_rec = E - I
+    W_rec = mag * pos_m
+    # normalize each by sum of their columns and mult by scale factor
+    W_rec = W_rec / W_rec.sum(0, keepdim=True).clamp(min=1e-6) * args.rec_scaler
     W_rec.fill_diagonal_(0.0)
     feat_rec = Weight(name="w_rec", value=W_rec.to(DEVICE))
     net.add_connection(
@@ -547,7 +540,8 @@ def main():
                                    pipeline=[feat_rec], device=DEVICE),
         source=LAYER_AC, target=LAYER_AC)
 
-    ac_mc_gen = torch.Generator(device="cpu").manual_seed(args.seed + 1)
+    # association to motor layer, the only learning layer
+    ac_mc_gen = torch.Generator(device="cpu").manual_seed(args.seed + 4)
     ac_mc_mask_gen = (torch.rand(args.ac, n_mc, generator=ac_mc_gen)
                   < 0.40).to(DEVICE) # 40% sparsity for ac->mc
 
