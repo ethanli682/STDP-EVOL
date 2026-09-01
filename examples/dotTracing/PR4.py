@@ -142,7 +142,7 @@ parser.add_argument("--ac_target_sparsity", type=float, default=0.10)
 
 # MOTOR layer 100 neurons per move (5 moves)
 parser.add_argument("--mc_pop", type=int, default=100)
-parser.add_argument("--ac_mc_sparsity", type=float, default=0.40)
+parser.add_argument("--ac_mc_sparsity", type=float, default=0.20)
 parser.add_argument("--ac_mc_init", type=float, default=0.3)  
 parser.add_argument("--w_max", type=float, default=1.0)
 parser.add_argument("--nu", type=float, default=4e-3)
@@ -155,7 +155,7 @@ args = parser.parse_args()
 
 moveChoices = 9 if args.diag else 5
 DEVICE = torch.device("cuda" if (torch.cuda.is_available() and args.gpu) else "cpu")
-OUT_FILE_PATH = "PR4_RUN_TEST4/"
+OUT_FILE_PATH = "PR4_RUN_TEST6/"
 
 LAYER_GCA, LAYER_GCT = "GC_A", "GC_T"      # grid code at agent / at target
 LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
@@ -299,6 +299,7 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
             total_reward += r
             intercepts += int(bool(intercept))
 
+            # save raster frames and gif replay
             if capturing:
                 if args.raster_replays or args.raster_timeline:
                     window = {
@@ -387,13 +388,11 @@ def main():
     # store all coordinate pairs
     world_xy = np.array([(r, c) for r in range(dim) for c in range(dim)],
                         dtype=np.float32)               
-    n_world = world_xy.shape[0]
     # centre the lattice on the board so rotations pivot about the middle
     board_centre = np.array([(dim - 1) / 2.0, (dim - 1) / 2.0], dtype=np.float32)
     world_rel = world_xy - board_centre                       # (n_world, 2)
     extent = dim / 2.0
 
-    phase_side = int(round(np.sqrt(args.gc_offsets)))
     gc_fields, gc_meta = [], []
 
     for s in args.gc_scales:
@@ -459,13 +458,13 @@ def main():
                     lbound=args.pc_lbound)
 
     ac = LIFNodes(n=args.ac, traces=True,
-                  rest=-64.0, reset=-70.0, thresh=-55.0,
+                  rest=-64.0, reset=-70.0, thresh=-50.0,
                   refrac=1, tc_decay=20.0, tc_trace=20.0,
                   lbound=args.ac_lbound)
 
     n_mc = moveChoices * args.mc_pop
     mc = LIFNodes(n=n_mc, traces=True,
-                  rest=-64.0, reset=-64.0, thresh=-49.0,
+                  rest=-64.0, reset=-64.0, thresh=-55.0,
                   refrac=0, tc_decay=20.0, tc_trace=20.0)
 
     net.add_layer(gc_a, name=LAYER_GCA)
@@ -507,8 +506,9 @@ def main():
     dense_fan = float(2 * args.n_pc)
     pc_ac_a_mask = (torch.rand(args.n_pc, args.ac, generator=gen_a) 
                     <= args.pc_ac_sparsity).float().to(DEVICE)
+    # decrease agent place cell influence slightly
     W_pc_ac_a = (pc_ac_a_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
-                 / np.sqrt(dense_fan)) * args.pc_ac_gain
+                 / np.sqrt(dense_fan)) * (args.pc_ac_gain/1.2) 
     pc_ac_t_mask = (torch.rand(args.n_pc, args.ac, generator=gen_t) 
                         <= args.pc_ac_sparsity).float().to(DEVICE)
     W_pc_ac_t = (pc_ac_t_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
@@ -528,11 +528,9 @@ def main():
 
     # Recurrent association layer connection reservoir, no learning done
     rec_gen = torch.Generator(device="cpu").manual_seed(args.seed)
-    mag = torch.rand(args.ac, args.ac, generator=rec_gen)
-    pos_m = (torch.rand(args.ac, args.ac, generator=rec_gen) < 0.45).float()
-    W_rec = mag * pos_m
+    W_rec = torch.randn(args.ac, args.ac, generator=rec_gen)
     # normalize each by sum of their columns and mult by scale factor
-    W_rec = W_rec / W_rec.sum(0, keepdim=True).clamp(min=1e-6) 
+    W_rec = W_rec / W_rec.abs().sum(0, keepdim=True).clamp(min=1e-6) 
     W_rec.fill_diagonal_(0.0)
     feat_rec = Weight(name="w_rec", value=W_rec.to(DEVICE))
     net.add_connection(
@@ -543,13 +541,13 @@ def main():
     # association to motor layer, the only learning layer
     ac_mc_gen = torch.Generator(device="cpu").manual_seed(args.seed + 4)
     ac_mc_mask_gen = (torch.rand(args.ac, n_mc, generator=ac_mc_gen)
-                  < 0.40).to(DEVICE) # 40% sparsity for ac->mc
+                  < args.ac_mc_sparsity).to(DEVICE) # 20% sparsity for ac->mc
 
     ac_mc_mask = Mask(name='ac_mc_mask',value=ac_mc_mask_gen)
  
     W_ac_mc = ac_mc_mask_gen * torch.rand(args.ac, n_mc, device=DEVICE)
  
-    feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc,
+    feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc, range=[0,3],
                         learning_rule=MSTDPET, nu=[args.nu, args.nu])
     net.add_connection(
         MulticompartmentConnection(source=ac, target=mc,
