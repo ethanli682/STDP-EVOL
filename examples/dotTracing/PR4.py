@@ -129,7 +129,7 @@ parser.add_argument("--pc_lbound", type=float, default=-80.0)
 parser.add_argument("--ac", type=int, default=1000) 
 parser.add_argument("--gc_ac_sparsity", type=float, default=0.12)
 parser.add_argument("--pc_ac_sparsity", type=float, default=0.1)
-parser.add_argument("--pc_ac_gain", type=float, default=25.0) 
+parser.add_argument("--pc_ac_gain", type=float, default=120.0) 
 parser.add_argument("--ac_gain", type=float, default=12.0)  
 parser.add_argument("--ac_lbound", type=float, default=-80.0) 
 parser.add_argument("--rec_mode", type=str, default="random",
@@ -155,7 +155,7 @@ args = parser.parse_args()
 
 moveChoices = 9 if args.diag else 5
 DEVICE = torch.device("cuda" if (torch.cuda.is_available() and args.gpu) else "cpu")
-OUT_FILE_PATH = "PR4_RUN_TEST3/"
+OUT_FILE_PATH = "PR4_RUN_TEST4/"
 
 LAYER_GCA, LAYER_GCT = "GC_A", "GC_T"      # grid code at agent / at target
 LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
@@ -459,7 +459,7 @@ def main():
                     lbound=args.pc_lbound)
 
     ac = LIFNodes(n=args.ac, traces=True,
-                  rest=-64.0, reset=-70.0, thresh=-45.0,
+                  rest=-64.0, reset=-70.0, thresh=-55.0,
                   refrac=1, tc_decay=20.0, tc_trace=20.0,
                   lbound=args.ac_lbound)
 
@@ -532,7 +532,7 @@ def main():
     pos_m = (torch.rand(args.ac, args.ac, generator=rec_gen) < 0.45).float()
     W_rec = mag * pos_m
     # normalize each by sum of their columns and mult by scale factor
-    W_rec = W_rec / W_rec.sum(0, keepdim=True).clamp(min=1e-6) * args.rec_scaler
+    W_rec = W_rec / W_rec.sum(0, keepdim=True).clamp(min=1e-6) 
     W_rec.fill_diagonal_(0.0)
     feat_rec = Weight(name="w_rec", value=W_rec.to(DEVICE))
     net.add_connection(
@@ -547,7 +547,7 @@ def main():
 
     ac_mc_mask = Mask(name='ac_mc_mask',value=ac_mc_mask_gen)
  
-    W_ac_mc = ac_mc_mask_gen * torch.rand(args.ac, n_mc, device=DEVICE) * args.ac_mc_init
+    W_ac_mc = ac_mc_mask_gen * torch.rand(args.ac, n_mc, device=DEVICE)
  
     feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc,
                         learning_rule=MSTDPET, nu=[args.nu, args.nu])
