@@ -272,6 +272,8 @@ def gcRates(view_vec, W_grid, peak, max_rate):
 # Connectivity. Convergence-based, NOT probabilistic -- the gene length has to
 # be deterministic or EVOL and the network disagree about what the vector means.
 # --------------------------------------------------------------------------- #
+
+# connect each ac neuron to 25 randomly selected grid cell neuron
 def buildConvergenceMask(n_pre, n_post, convergence, seed, device):
     """
     Each postsynaptic neuron receives from exactly K distinct presynaptic
@@ -309,7 +311,7 @@ def applyGeneToWeights(weight_tensor, src_idx, gene_vec, w_min, w_max):
         weight_tensor[src_idx, cols] = v.view(K, n_post).clamp(w_min, w_max)
     return weight_tensor
 
-
+#not used 
 def extractGeneFromWeights(weight_tensor, src_idx):
     """Inverse of applyGeneToWeights -- used for lamarckian inheritance."""
     K, n_post = src_idx.shape
@@ -613,6 +615,7 @@ def buildNetwork(cfg, device):
     # --- GC -> AC : fixed. Evolved only if 'gc_ac' is in cfg['plastic']. ---
     gc_ac_mask, gc_ac_src = buildConvergenceMask(
         n_gc, cfg["ac"], cfg["gc_ac_convergence"], seed, device)
+    
     g = torch.Generator().manual_seed(seed + 7)
     W_gc_ac = (gc_ac_mask.cpu() * torch.rand(n_gc, cfg["ac"], generator=g)).to(device)
     fan_in = gc_ac_mask.sum(0).mean().clamp(min=1.0)

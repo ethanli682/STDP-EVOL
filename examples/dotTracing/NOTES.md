@@ -35,6 +35,9 @@ add competition amoung motor layer (maybe)
 Improve upon place cell, I should be able to tell where the target+agent are
 just by looking at the place cell spiking
 
+
+PUT ALL THIS INTO A PICTURE TO SHARE ON TUESDAY
+
 # ISSUES
 
 8/31

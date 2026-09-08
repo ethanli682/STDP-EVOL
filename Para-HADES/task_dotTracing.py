@@ -4,6 +4,8 @@ from datetime import datetime
 from slurmHPCHelper import *
 from GA_utils_misc_func import pickle_loads_compat
 import numpy as np
+
+# main dot tracing task in this file
 import dot_tracingtask
 
 # Import the unified plotting system
@@ -34,18 +36,11 @@ def run_task(param, args):
     #------------------------Task Start--------------------------------------
     #calls the file with simulation
     try:
-        outP = dot_tracingtask.do_task(param, args)
-        if not isinstance(outP, dict):
-            raise TypeError(f"do_task returned {type(outP).__name__}, expected dict")
-        if "fitnessScore" not in outP:
-            raise KeyError("do_task returned a dict with no 'fitnessScore'")
+        outP = dot_tracingtask.do_task(param)
     except Exception as exc:
-        # A crashed candidate must not kill the agent -- report it as an
-        # unscored individual and let GA drop it.
         print(f"Task - candidate FAILED: {exc}", flush=True)
         traceback.print_exc()
         outP = {"fitnessScore": None, "error": str(exc)}
-
     
     #------------------------------------------------------------------------------------------
     

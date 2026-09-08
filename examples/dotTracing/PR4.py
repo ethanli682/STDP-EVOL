@@ -143,7 +143,9 @@ parser.add_argument("--ac_target_sparsity", type=float, default=0.10)
 # MOTOR layer 100 neurons per move (5 moves)
 parser.add_argument("--mc_pop", type=int, default=100)
 parser.add_argument("--ac_mc_sparsity", type=float, default=0.20)
-parser.add_argument("--ac_mc_init", type=float, default=0.3)  
+parser.add_argument("--ac_mc_init", type=float, default=0.3)
+parser.add_argument("--mc_opp_inh", type=float, default=20.0)
+parser.add_argument("--mc_lbound", type=float, default=-80.0)
 parser.add_argument("--w_max", type=float, default=1.0)
 parser.add_argument("--nu", type=float, default=4e-3)
 
@@ -155,11 +157,14 @@ args = parser.parse_args()
 
 moveChoices = 9 if args.diag else 5
 DEVICE = torch.device("cuda" if (torch.cuda.is_available() and args.gpu) else "cpu")
-OUT_FILE_PATH = "PR4_RUN_TEST6/"
+OUT_FILE_PATH = "PR4_RUN_TEST7/"
 
 LAYER_GCA, LAYER_GCT = "GC_A", "GC_T"      # grid code at agent / at target
 LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
 LAYER_AC, LAYER_MC = "AC", "MC"
+
+
+OPPONENT_PAIRS = [(1, 3), (2, 4)]          # up<->down, right<->left
 
 torch.manual_seed(args.seed)
 np.random.seed(args.seed)
@@ -382,7 +387,6 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
             env.cycleOutFiles()
 
 
-# --------------------------------------------------------------------------- #
 def main():
     dim = args.dim
     # store all coordinate pairs
@@ -390,7 +394,7 @@ def main():
                         dtype=np.float32)               
     # centre the lattice on the board so rotations pivot about the middle
     board_centre = np.array([(dim - 1) / 2.0, (dim - 1) / 2.0], dtype=np.float32)
-    world_rel = world_xy - board_centre                       # (n_world, 2)
+    world_rel = world_xy - board_centre                 
     extent = dim / 2.0
 
     gc_fields, gc_meta = [], []
@@ -430,7 +434,6 @@ def main():
                     gc_fields.append(field.astype(np.float32))
                     gc_meta.append((s, theta, a, b))
 
-
     W_grid_np = np.stack(gc_fields, axis=1)       
     peak_np = W_grid_np.max(axis=0, keepdims=True)
     peak_np[peak_np == 0] = 1.0
@@ -442,7 +445,6 @@ def main():
     n_gc = W_grid.shape[1]
 
     net = Network(dt=args.dt)
-
     gc_a = Input(n=n_gc, shape=[1, 1, 1, 1, n_gc], traces=True)
     gc_t = Input(n=n_gc, shape=[1, 1, 1, 1, n_gc], traces=True)
 
@@ -462,10 +464,12 @@ def main():
                   refrac=1, tc_decay=20.0, tc_trace=20.0,
                   lbound=args.ac_lbound)
 
+    # neurons 0-99: pause, 100-199: up, 200-299: right, 300-399: down, 400-499: left
     n_mc = moveChoices * args.mc_pop
     mc = LIFNodes(n=n_mc, traces=True,
                   rest=-64.0, reset=-64.0, thresh=-55.0,
-                  refrac=0, tc_decay=20.0, tc_trace=20.0)
+                  refrac=0, tc_decay=20.0, tc_trace=20.0,
+                  lbound=args.mc_lbound)
 
     net.add_layer(gc_a, name=LAYER_GCA)
     net.add_layer(gc_t, name=LAYER_GCT)
@@ -554,10 +558,30 @@ def main():
                                    pipeline=[feat_ac_mc,ac_mc_mask], device=DEVICE),
         source=LAYER_AC, target=LAYER_MC)
 
+    # MOTOR opponent inhibition (MC -> MC, frozen)
+    feat_mc_opp = None
+    if args.mc_opp_inh > 0.0:
+        W_mc_opp = torch.zeros(n_mc, n_mc, device=DEVICE)
+        # per-synapse magnitude: mc_pop presynaptic partners share the budget
+        w_opp = args.mc_opp_inh / float(args.mc_pop) # -0.2 currently
+        for a, b in OPPONENT_PAIRS: # two pairs - up down and right left
+            sa = slice(a * args.mc_pop, (a + 1) * args.mc_pop)
+            sb = slice(b * args.mc_pop, (b + 1) * args.mc_pop)
+            W_mc_opp[sa, sb] = -w_opp     # a inhibits b
+            W_mc_opp[sb, sa] = -w_opp     # b inhibits a
+
+        feat_mc_opp = Weight(name="w_mc_opp", value=W_mc_opp)
+        net.add_connection(
+            MulticompartmentConnection(source=mc, target=mc,
+                                       pipeline=[feat_mc_opp], device=DEVICE),
+            source=LAYER_MC, target=LAYER_MC)
+
     net.to(DEVICE)
     weight_features = {"gc_pc_a": feat_gc_pc_a, "gc_pc_t": feat_gc_pc_t,
                        "pc_ac_a": feat_pc_ac_a, "pc_ac_t": feat_pc_ac_t,
                        "recurrent": feat_rec, "ac_mc": feat_ac_mc}
+    if feat_mc_opp is not None:
+        weight_features["mc_opp"] = feat_mc_opp
 
     print(f"[arch] GC {n_gc} x2  ->  PC {args.n_pc} x2 (sparse "
           f"{args.gc_pc_sparsity:.0%})  ->  AC {args.ac} (dense)  ->  MC {n_mc}")
