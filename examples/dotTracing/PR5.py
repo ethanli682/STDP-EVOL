@@ -1,48 +1,4 @@
-"""
-Dot-tracing SNN restructured along the DeltaQ paper's GC -> AC -> MC architecture
-(Earl et al., bioRxiv 2026)
-
-Mapping from the paper to this task
------------------------------------
-  Grid Cells (560)        -> GC layer: multi-scale periodic Gaussian basis applied
-                             as a FIXED projection over the egocentric pixel view.
-                             Prime scales, 7 rotations, 16 phase offsets = 560.
-  Association Cells (2000)-> AC layer: LIF, sparse (12%) fixed random projection
-                             from GC, coincidence-detection tuning -> sparse,
-                             place-field-like responses over relative prey position.
-  Motor Cells (400)       -> MC layer: one subpopulation per action, WTA on
-                             aggregate subpopulation spike count.
-  AC->MC plastic only     -> MSTDPET on AC->MC only. GC->AC frozen. 
-
-Rate convention: the paper's "8 Hz" over a 1000 ms decision window means 8 spikes
-per decision. This script matches SPIKES PER DECISION, not Hz, so gc_max_rate
-defaults to 80 Hz over the 100 ms granularity window.
-
-Tuning the AC layer
--------------------
-Only two knobs set AC activity, and they fight each other:
-
-  --ac_gain   scales the frozen GC->AC feedforward weights (mV per presyn spike,
-              after 1/sqrt(fan-in) normalisation).
-  --rec_exc / --rec_inh
-              TOTAL per-neuron recurrent budgets in mV -- the drive a cell would
-              get if every excitatory (resp. inhibitory) partner fired on one
-              timestep. Column-normalised, so they do NOT scale with --ac. This
-              matters: with the raw Mexican hat, every AC's inhibitory row summed
-              to about -790 mV at --ac 1000, roughly 300x the feedforward drive.
-              That is a negative-feedback loop stiff enough that --ac_gain has no
-              measurable effect -- exactly the failure mode of "keep raising
-              ac_gain and nothing happens".
-
-The AC LIF also has --ac_lbound. Recurrent inhibition here is subtractive and
-BindsNET does not floor the membrane voltage by default, so without it one
-synchronous burst drives v to -1000s of mV; since reset_state_variables() runs
-once per episode rather than once per decision, the layer then stays dead for the
-whole episode and the plastic AC->MC weights never move.
-
-Target operating point: ~10% of AC active per decision, coverage 1.00, nn_ratio
-well below 0.6. --diagnose prints all of these before training starts.
-"""
+# the goal of this is to improve upon the rewarding mechanism
 
 from ast import arg
 
@@ -78,8 +34,8 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--dim", type=int, default=28)
 parser.add_argument("--granularity", type=int, default=100)
 parser.add_argument("--dt", type=float, default=1.0)
-parser.add_argument("--trn_eps", type=int, default=2000)
-parser.add_argument("--tst_eps", type=int, default=1000)
+parser.add_argument("--trn_eps", type=int, default=300)
+parser.add_argument("--tst_eps", type=int, default=150)
 parser.add_argument("--decay", type=int, default=4)
 parser.add_argument("--herrs", type=int, default=0)
 parser.add_argument("--diag", type=bool, default=False)
@@ -112,7 +68,7 @@ parser.add_argument("--raster_layers", type=str, nargs="+",
 parser.add_argument("--raster_max_neurons", type=int, default=0)
 
 # GC layer 
-parser.add_argument("--gc_scales", type=int, nargs="+", default=[5, 7, 11, 13, 17])
+parser.add_argument("--gc_scales", type=int, nargs="+", default=[3, 5, 7, 11, 13])
 parser.add_argument("--gc_rotations", type=int, default=7)
 parser.add_argument("--gc_offsets", type=int, default=16)   # 4x4 phase grid
 parser.add_argument("--gc_global_scale", type=float, default=1.0)  # paper's g
@@ -157,7 +113,7 @@ args = parser.parse_args()
 
 moveChoices = 9 if args.diag else 5
 DEVICE = torch.device("cuda" if (torch.cuda.is_available() and args.gpu) else "cpu")
-OUT_FILE_PATH = "PR4_RUN_TEST7/"
+OUT_FILE_PATH = "PR5_RUN_TEST2/"
 
 LAYER_GCA, LAYER_GCT = "GC_A", "GC_T"      # grid code at agent / at target
 LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
@@ -180,8 +136,6 @@ def wtaAction(mc_spikes, n_actions, rng):
     return int(torch.argmax(agg).item())
 
 # TRAINING LOOP
-# todo: reward is currently more sparse but the reward still needs
-# to serve as an indicator
 def runSimulator(net, env, spikes, episodes, W_grid, peak,
                  feat_ac_mc, gran=100, rfname="", pfname="",
                  weight_features=None, render_replays=False, render_every=25,
@@ -192,6 +146,8 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
     zero_gc = torch.zeros(W_grid.shape[1], device=DEVICE)
     rng = np.random.default_rng(args.seed)
     spike_ims = spike_axes = None
+
+    past_performances = []
 
     for ep in range(episodes):
         total_reward, intercepts, step = 0.0, 0, 0
@@ -228,11 +184,15 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
         clock = time.time()
         ac_frac_sum, mc_frac_sum = 0.0, 0.0
 
+        avg_reward = 0
+
         while not done:
             step += 1
 
             # get prev row+col and calc dist
             pr, pc = env.netDot.row[0], env.netDot.col[0]
+            # get target row+col before the step
+            tr, tc = env.dots[0].row[0], env.dots[0].col[0]
             prev_dist = np.hypot(pr - env.dots[0].row[0], pc - env.dots[0].col[0])
 
             # take a step
@@ -240,26 +200,16 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
 
             # agent row+col after the step
             cr, cc = env.netDot.row[0], env.netDot.col[0]
-            # target row+col after the step
-            tr, tc = env.dots[0].row[0], env.dots[0].col[0]
 
             # calc change in dist
             curr_dist = np.hypot(cr - tr, cc - tc)
             r = prev_dist - curr_dist
 
-            # calculate alignment based on dot product
-            # dr_p, dc_p = tr - pr, tc - pc
-            # dr_m, dc_m = cr - pr, cc - pc
-            # dmag, mmag = np.hypot(dr_p, dc_p), np.hypot(dr_m, dc_m)
-
-            # alignment = 0.0 if (mmag < 1e-8 or dmag < 1e-8) else \
-            #     float(np.clip((dr_m * dr_p + dc_m * dc_p) / (dmag * mmag), -1, 1))
-            # scale = 0.5 + 0.5 * alignment
-            # r = delta * ((0.5 + scale) if delta >= 0 else (1.5 - scale))
-            # r += 0.2 * alignment
-
             if intercept:
                 r += 10.0
+
+            avg_reward += r
+                
             # decrease reward over time
             if args.make_sparse: 
                 r *= (ep/episodes+0.5)
@@ -344,6 +294,15 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
                 print(f"  step {step} ({time.time() - clock:.2f}s) "
                       f"r={r:+.3f}")
                 clock = time.time()
+
+        # create a sliding history window of past rewards
+        if len(past_performances) < 20:
+            past_performances.insert(0,avg_reward/100)
+        else:
+            past_performances.insert(0,avg_reward/100)
+            past_performances.pop()
+            avg_perf = sum(past_performances)/len(past_performances)
+            print(f"AVERAGE REWARD PAST 20: {avg_perf}", flush=True)
 
         if net.reward_fn is not None:
             net.reward_fn.update(accumulated_reward=total_reward, steps=step)
@@ -535,7 +494,7 @@ def main():
     W_rec = torch.randn(args.ac, args.ac, generator=rec_gen)
     # normalize each by sum of their columns and mult by scale factor
     # W_rec = W_rec / W_rec.abs().sum(0, keepdim=True).clamp(min=1e-6) 
-    W_rec = W_rec / 60 # use 60 (arbitrary number) as a normalization number
+    W_rec = W_rec / 30 # use 60 (arbitrary number) as a normalization number
     W_rec.fill_diagonal_(0.0)
     feat_rec = Weight(name="w_rec", value=W_rec.to(DEVICE))
     net.add_connection(
@@ -553,7 +512,7 @@ def main():
     # apply some scaling number to the acmc weight
     W_ac_mc = ac_mc_mask_gen * torch.rand(args.ac, n_mc, device=DEVICE) * 5
  
-    feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc, range=[0,3],
+    feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc, range=[0,5],
                         learning_rule=MSTDPET, nu=[args.nu, args.nu])
     net.add_connection(
         MulticompartmentConnection(source=ac, target=mc,

@@ -1,3 +1,12 @@
+# MODEL changelog
+added competition amoung the motor layer
+
+rewarding: made the change in distance only based on the agent's movement
+
+added an evaluation number that will hopefully reflect agent performance
+
+
+
 # PARAM change history
 
 Increase threashold on the place cell population to be more selective (this layer fires too much)
@@ -24,21 +33,24 @@ Recurrent is just 50% pos and 50% neg- fixed
 Increased the sparsity of the ac_mc layer to prevent any single ac neuron
 to over-fire the mc layer
 
+Decreased the normalization of the recurrent connection 
+avg sum of column -> 60 -> 30
+This is done to hopefully encourage more competition and sparsity
+
+Changed the starting prime number in grid cell back to 3
+
 
 # TODO
-improve the rewarding mechanism to better reflect agent performance
 
-add more sparsity as time goes on
 
-add competition amoung motor layer (maybe)
+add more sparsity as time goes on - unsure
+
 
 Improve upon place cell, I should be able to tell where the target+agent are
 just by looking at the place cell spiking
 
 
-PUT ALL THIS INTO A PICTURE TO SHARE ON TUESDAY
-
-# ISSUES
+# ISSUES/documentation
 
 8/31
 Spiking of the ac and mc layer needs to be tuned.
@@ -52,6 +64,9 @@ idk what to do about the decaying tail, probably my current method of input is g
 Place cells randomly begin spiking a lot more than usual, which causes vertical lines
 of firing in the ac and mc layer. This always seems to force the motor layer into a 
 horizontal line
+
+9/9
+Vertical lines have disappeared, 
 
 
 
