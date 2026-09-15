@@ -1,920 +1,863 @@
+# the goal of this is to improve upon the rewarding mechanism
+
 import matplotlib
 matplotlib.use("Agg")
 
 import argparse
 import itertools
 import os
-import sys
 import time
-import copy
 
 import numpy as np
+import torch
+from PIL import Image
 
-# torch and bindsnet are optional at import time so that --gene_lengths and
-# YAML validation run on a machine without the full SNN stack installed.
-try:
-    import torch
-except ImportError:  
-    torch = None
+import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
 
-# bindsnet imports are deferred into _lazy_imports() so that --gene_lengths and
-# YAML validation work on a machine without bindsnet installed.
-Network = Monitor = Input = LIFNodes = None
-MulticompartmentConnection = Weight = MSTDPET = poisson = DotSimulator = None
+from bindsnet.analysis.plotting import plot_spikes
+from bindsnet.encoding import poisson
+from bindsnet.environment.dot_simulator import DotSimulator
+from bindsnet.learning.MCC_learning import MSTDPET
+from bindsnet.network import Network
+from bindsnet.network.monitors import Monitor
+from bindsnet.network.nodes import Input, LIFNodes
+from bindsnet.network.topology import MulticompartmentConnection
+from bindsnet.network.topology_features import Weight, Mask
+
+def str2bool(v):
+    if isinstance(v, bool):
+        return v
+    if str(v).lower() in ("yes", "true", "t", "y", "1"):
+        return True
+    if str(v).lower() in ("no", "false", "f", "n", "0"):
+        return False
+    raise argparse.ArgumentTypeError(f"boolean value expected, got {v!r}")
 
 
-# imports for SNN
-def _lazy_imports():
-    global Network, Monitor, Input, LIFNodes
-    global MulticompartmentConnection, Weight, MSTDPET, poisson, DotSimulator
-    if Network is not None:
-        return
-    if torch is None:
-        raise ImportError(
-            "PyTorch is required to run the network but is not installed. "
-            "(`--gene_lengths` works without it; `--selftest`, `--calibrate` "
-            "and do_task do not.)"
+parser = argparse.ArgumentParser()
+# task / env
+parser.add_argument("--steps", type=int, default=100)
+parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--dim", type=int, default=28)
+parser.add_argument("--granularity", type=int, default=100)
+parser.add_argument("--dt", type=float, default=1.0)
+parser.add_argument("--trn_eps", type=int, default=100)
+parser.add_argument("--tst_eps", type=int, default=50)
+parser.add_argument("--decay", type=int, default=4)
+parser.add_argument("--herrs", type=int, default=0)
+parser.add_argument("--diag", type=str2bool, default=False)
+parser.add_argument("--randr", type=float, default=0.15)
+parser.add_argument("--boundh", type=str, default="bounce")
+parser.add_argument("--fit_func", type=str, default="dir")
+parser.add_argument("--allow_stay", type=str2bool, default=False)
+parser.add_argument("--pandas", type=str2bool, default=False)
+parser.add_argument("--mute", type=str2bool, default=False)
+parser.add_argument("--write", type=str2bool, default=False)
+parser.add_argument("--fcycle", type=int, default=100)
+parser.add_argument("--gpu", type=str2bool, default=True)
+parser.add_argument("--view_r", type=int, default=14)
+parser.add_argument("--make_sparse", type=str2bool, default=False)
+
+# rendering 
+parser.add_argument("--render_replays", type=str2bool, default=True)
+parser.add_argument("--render_every", type=int, default=10)
+parser.add_argument("--replay_fps", type=int, default=20)
+parser.add_argument("--plot_every", type=int, default=50)
+# Raster replays: for every episode that gets an env GIF, also emit a spike-raster
+# GIF with one frame per decision, plus a whole-episode raster timeline PNG.
+parser.add_argument("--raster_replays", type=str2bool, default=True)
+parser.add_argument("--raster_timeline", type=str2bool, default=True)
+parser.add_argument("--raster_layers", type=str, nargs="+",
+                    default=["PC_A", "PC_T", "AC", "MC"])
+# 0 (the default) plots EVERY neuron in the layer. A positive value draws an
+# evenly spaced subsample instead. Spike counts, not neuron counts, drive the
+# drawing cost, so plotting all of them is cheap.
+parser.add_argument("--raster_max_neurons", type=int, default=0)
+
+# GC layer 
+parser.add_argument("--gc_scales", type=int, nargs="+", default=[3, 5, 7, 11, 13])
+parser.add_argument("--gc_rotations", type=int, default=7)
+parser.add_argument("--gc_offsets", type=int, default=16)   # 4x4 phase grid
+parser.add_argument("--gc_global_scale", type=float, default=1.0)  # paper's g
+parser.add_argument("--gc_sharpness", type=float, default=1.0)     # paper's k
+parser.add_argument("--gc_max_rate", type=float, default=80.0)     # 8 spikes / 100 ms
+
+# PLACE CELL layers: one for the agent, one for the target
+parser.add_argument("--n_pc", type=int, default=500)          # per place layer
+parser.add_argument("--gc_pc_sparsity", type=float, default=0.05) 
+parser.add_argument("--pc_lbound", type=float, default=-80.0)
+
+# ASSOCIATION layer 
+parser.add_argument("--ac", type=int, default=1000) 
+parser.add_argument("--gc_ac_sparsity", type=float, default=0.12)
+parser.add_argument("--pc_ac_sparsity", type=float, default=0.1)
+parser.add_argument("--ac_lbound", type=float, default=-80.0) 
+
+# MOTOR layer 100 neurons per move (5 moves)
+parser.add_argument("--mc_pop", type=int, default=100)
+parser.add_argument("--ac_mc_sparsity", type=float, default=0.20)
+parser.add_argument("--ac_mc_init", type=float, default=0.3)
+parser.add_argument("--mc_lbound", type=float, default=-80.0)
+parser.add_argument("--w_max", type=float, default=1.0)
+parser.add_argument("--nu", type=float, default=4e-3)
+
+parser.add_argument("--diagnose", type=str2bool, default=True)
+parser.add_argument("--diag_stride", type=int, default=4)   # probe positions
+parser.add_argument("--diag_thresh", type=int, default=4)   # spikes -> "active"
+
+# PLACE-CELL LOCATION MAP (`--pc_map True` runs it and exits before training)
+parser.add_argument("--pc_map", type=str2bool, default=True)
+parser.add_argument("--pc_map_stride", type=int, default=1)   # 1 = every square
+parser.add_argument("--pc_map_reps", type=int, default=2)     # >=2 enables decode
+parser.add_argument("--pc_map_thresh", type=int, default=4)   # spikes -> "fired"
+parser.add_argument("--pc_map_top", type=int, default=10)     # idx shown per row
+parser.add_argument("--pc_map_fields", type=int, default=25)  # fields to plot
+parser.add_argument("--pc_map_layers", type=str, nargs="+",
+                    default=["PC_A", "PC_T"])
+
+# Parse sys.argv ONLY when this file is the entry point. When Para-HADES imports
+# it, sys.argv belongs to task_dotTracing.py (--path, --agent_idx, ...) and a real
+# parse would abort the worker with SystemExit(2) at import time. Passing [] gives
+# the defaults above, which are the single source of truth for the architecture --
+# task_dotTracing.yaml no longer carries a main.DotTracing block.
+args = parser.parse_args() if __name__ == "__main__" else parser.parse_args([])
+
+moveChoices = 9 if args.diag else 5
+DEVICE = torch.device("cuda" if (torch.cuda.is_available() and args.gpu) else "cpu")
+
+LAYER_GCA, LAYER_GCT = "GC_A", "GC_T"      # grid code at agent / at target
+LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
+LAYER_AC, LAYER_MC = "AC", "MC"
+
+
+OPPONENT_PAIRS = [(1, 3), (2, 4)]          # up<->down, right<->left
+
+
+# --------------------------------------------------------------------------- #
+# Gene access. Para-HADES hands every `param:` entry back as a flat list, even
+# the array: [1] scalars, so unwrap before use.
+# --------------------------------------------------------------------------- #
+def geneScalar(param, key):
+    try:
+        v = param["param"][key]
+    except (TypeError, KeyError):
+        raise KeyError(
+            f"gene '{key}' missing from param['param']. task_dotTracing.yaml must "
+            f"declare it under `param:` with array: [1]."
         )
-    from bindsnet.encoding import poisson as _poisson
-    from bindsnet.environment.dot_simulator import DotSimulator as _DotSimulator
-    from bindsnet.learning.MCC_learning import MSTDPET as _MSTDPET
-    from bindsnet.network import Network as _Network
-    from bindsnet.network.monitors import Monitor as _Monitor
-    from bindsnet.network.nodes import Input as _Input, LIFNodes as _LIFNodes
-    from bindsnet.network.topology import MulticompartmentConnection as _MCC
-    from bindsnet.network.topology_features import Weight as _Weight
-    Network, Monitor, Input, LIFNodes = _Network, _Monitor, _Input, _LIFNodes
-    MulticompartmentConnection, Weight, MSTDPET = _MCC, _Weight, _MSTDPET
-    poisson, DotSimulator = _poisson, _DotSimulator
+    return float(np.asarray(v, dtype=np.float64).ravel()[0])
 
 
-LAYER_GC, LAYER_AC, LAYER_MC = "GC", "AC", "MC"
+def geneArray(param, key, n):
+    try:
+        v = param["param"][key]
+    except (TypeError, KeyError):
+        raise KeyError(
+            f"gene '{key}' missing from param['param']. task_dotTracing.yaml must "
+            f"declare it under `param:` with array: [{n}]."
+        )
+    a = np.asarray(v, dtype=np.float32).ravel()
+    if a.size != n:
+        raise ValueError(
+            f"gene '{key}' has {a.size} values but this config needs {n}. "
+            f"Fix `array:` in task_dotTracing.yaml."
+        )
+    return a
 
-# --------------------------------------------------------------------------- #
-# Defaults params. Every key here can be overridden by param["DotTracing"] in the YAML.
-# Anything the YAML sets that is NOT in here raises a warning (typo guard).
-# --------------------------------------------------------------------------- #
-DEFAULT_CFG = dict(
-    # --- task / environment ---
-    steps=100,
-    dim=28,
-    granularity=100,
-    dt=1.0,
-    decay=4,
-    herrs=0,
-    diag=False,
-    randr=0.15,
-    bound_hand="bounce",
-    fit_func="dir",
-    allow_stay=False,
-    view_r=14,
+# select action based on the largest spiking population
+def wtaAction(mc_spikes, n_actions, rng):
+    """mc_spikes: (time, n_mc) -> action index. Aggregate count per subpopulation."""
+    counts = mc_spikes.sum(0)
+    pops = torch.chunk(counts, n_actions)
+    agg = torch.stack([p.sum() for p in pops])
+    if agg.max() == 0:
+        return int(rng.integers(0, n_actions))
+    return int(torch.argmax(agg).item())
 
-    # --- GC layer (fixed, never plastic, never evolved) ---
-    gc_scales=[3, 5, 7, 11, 13],
-    gc_rotations=7,
-    gc_offsets=16,
-    gc_global_scale=1.0,
-    gc_sharpness=1.0,
-    gc_max_rate=80.0,
+# TRAINING LOOP
+def runSimulator(net, env, spikes, episodes, W_grid, peak,
+                 feat_ac_mc, gran=100, rfname="", pfname="",
+                 weight_features=None, render_replays=False, render_every=25,
+                 replay_fps=20, replay_prefix="replay", view_r=14,
+                 dim=28):
+    dt = net.dt
+    peak_v = peak.squeeze(0)                       # (n_gc,) hoisted out of the loop
+    zero_gc = torch.zeros(W_grid.shape[1], device=DEVICE)
+    rng = np.random.default_rng(args.seed)
+    spike_ims = spike_axes = None
 
-    # --- AC layer ---
-    ac=400,
-    gc_ac_convergence=25,
-    ac_gain=14.0,
-    rec_mode="local",
-    rec_inh=1.2,
-    rec_radius=4.0,
+    past_performances = []
 
-    # --- MC layer ---
-    mc_pop=40,
-    ac_mc_convergence=20,
+    for ep in range(episodes):
+        total_reward, intercepts, step = 0.0, 0, 0
+        visible_steps = 0                          # how often the target was in view
+        rewards = np.zeros(env.timesteps)
+        net.reset_state_variables()
+        env.reset()
+        done = False
 
-    # --- topology seed: fixed for the whole population ---
-    model_seed=0,
+        capturing = render_replays and (ep % render_every == 0)
+        replay_frames = []
+        raster_frames, raster_windows = [], []
+        raster_ims = raster_axes = raster_fig = None
+        raster_sizes = {l: (net.layers[l].n if args.raster_max_neurons <= 0
+                            else min(net.layers[l].n, args.raster_max_neurons))
+                        for l in args.raster_layers}
+        if capturing:
+            env.render()          # pins plt.gcf() as the env figure on ep 0
+            replay_frames.append(captureFrame())
+            if args.raster_replays:
+                blank = {l: torch.zeros(gran, raster_sizes[l])
+                         for l in args.raster_layers}
+                raster_ims, raster_axes = plot_spikes(
+                    blank, ims=raster_ims, axes=raster_axes, figsize=(8,12))
+                raster_fig = plt.gcf()
+                styleRasterAxes(raster_axes, args.raster_layers, gran,
+                                raster_sizes, first_call=True)
+                raster_fig.suptitle(f"ep {ep}  initial state -- no decision yet",
+                                    fontsize=9)
+                raster_frames.append(captureFrame(raster_fig))
 
-    # --- what EVOL optimizes ---
-    plastic=["ac_mc"],
-    inheritance="darwinian",
+        action = int(rng.integers(0, env.action_space.n))
+        last_active_ac = torch.zeros(net.layers[LAYER_AC].n, device=DEVICE)
+        clock = time.time()
+        ac_frac_sum, mc_frac_sum = 0.0, 0.0
 
-    # --- weight box. MUST match param: min/max in the YAML. ---
-    w_min=0.0,
-    w_max=1.0,
+        avg_reward = 0
 
-    # --- STDP-RL: the lifetime learning ---
-    stdp_enabled=True,
-    nu=0.01,
-    eps_start=0.0,
-    eps_min=0.0,
-    eps_decay=1.0,
-    select="wta",
+        while not done:
+            step += 1
 
-    # --- critic     NOT USED FOR NOW ---
-    critic_mode="loss",       # 'loss' = paper form | 'env' = alignment reward
-    max_reward=1.0,
-    eta_positivity=5.0,
-    eta_closing=1.0,
-    critic_gain=1.0,
-    success_eps=0.01,
-    critic_dist_scale="auto",   # 'auto' = sqrt(2)*dim (grid diagonal)
+            # get prev row+col and calc dist
+            pr, pc = env.netDot.row[0], env.netDot.col[0]
+            # get target row+col before the step
+            tr, tc = env.dots[0].row[0], env.dots[0].col[0]
+            prev_dist = np.hypot(pr - env.dots[0].row[0], pc - env.dots[0].col[0])
 
-    # --- weight normalization (mandatory when STDP is live) ---
-    norm_reception=True,
-    reception_every=25,
-    norm_transmission=True,
-    transmission_min=0.1,
-    transmission_max=2.0,
-    norm_homeostasis=True,
-    homeostasis_every=75,
-    rate_window=500,
-    homeostasis_scale=0.0001,
-    rate_target_ac=5.5,
-    rate_target_mc=6.0,
+            # take a step
+            obs, _, done, intercept = env.step(action)
 
-    # --- lifetime / fitness ---
-    episodes=20,
-    fitness_metric="intercepts",   # 'intercepts' | 'reward'
-    fitness_last_k=5,
-    frozen_episodes=5,
-    episode_seed_base=12345,
-    seed_mode="common",            # 'common' | 'random'
+            # agent row+col after the step
+            cr, cc = env.netDot.row[0], env.netDot.col[0]
 
-    # --- misc ---
-    gpu=False,
-    cache_gc=True,
-    verbose=True,
-)
+            # calc change in dist
+            curr_dist = np.hypot(cr - tr, cc - tc)
+            r = prev_dist - curr_dist
+
+            if intercept:
+                r += 10.0
+
+            avg_reward += r
+                
+            # decrease reward over time
+            if args.make_sparse: 
+                r *= (ep/episodes+0.5)
+            reward = torch.tensor(r, dtype=torch.float32, device=DEVICE)
+
+            # W_grid is (n_world, n_gc): row k is the grid-cell population code
+            # for board square k. Because the lattice is anchored to the WORLD,
+            # reading a position is a row lookup, not a matrix product.
+            a_drive = (W_grid[int(cr) * dim + int(cc)] / peak_v).clamp(0.0, 1.0)
+            a_drive = torch.where(a_drive < 0.01, zero_gc, a_drive) # remove gaussian tail
+            rates_a = a_drive * args.gc_max_rate
+
+            # check if target is outside of the viewing radius of the agent
+            visible = (abs(int(tr) - int(cr)) <= view_r and
+                       abs(int(tc) - int(cc)) <= view_r)
+            if visible:
+                t_drive = (W_grid[int(tr) * dim + int(tc)] / peak_v).clamp(0.0, 1.0)
+                t_drive = torch.where(t_drive < 0.01, zero_gc, t_drive)
+                rates_t = t_drive * args.gc_max_rate
+            else:
+                rates_t = zero_gc                     # silent target stream
+            visible_steps += int(visible)
+
+            inputs = {
+                LAYER_GCA: poisson(rates_a.unsqueeze(0), gran, dt, device=DEVICE),
+                LAYER_GCT: poisson(rates_t.unsqueeze(0), gran, dt, device=DEVICE),
+            }
+
+            # run network with gridcell firing as input to get a move choice
+            net.run(inputs=inputs, time=gran, reward=reward)
+
+            mc = spikes[LAYER_MC].get("s").squeeze()          # (time, n_mc)
+            ac = spikes[LAYER_AC].get("s").squeeze()
+            last_active_ac = (ac.sum(0) >= 4).float()
+            ac_frac_sum += last_active_ac.mean().item()
+            mc_frac_sum += (mc.sum(0) > 0).float().mean().item()
+
+            # get the action from the most active motor cell population
+            action = wtaAction(mc, env.action_space.n, rng)
+
+            rewards[step - 1] = r
+            total_reward += r
+            intercepts += int(bool(intercept))
+
+            # save raster frames and gif replay
+            if capturing:
+                if args.raster_replays or args.raster_timeline:
+                    window = {
+                        l: rasterSubsample(
+                            spikes[l].get("s").squeeze().view(gran, -1),
+                            args.raster_max_neurons).detach().cpu()
+                        for l in args.raster_layers
+                    }
+                    if args.raster_timeline:
+                        raster_windows.append(window)
+                    if args.raster_replays:
+                        raster_ims, raster_axes = plot_spikes(
+                            window, ims=raster_ims, axes=raster_axes,
+                            figsize=(8,12))
+                        if raster_fig is None:
+                            raster_fig = plt.gcf()
+                            styleRasterAxes(raster_axes, args.raster_layers, gran,
+                                            raster_sizes, first_call=True)
+                        else:
+                            styleRasterAxes(raster_axes, args.raster_layers, gran,
+                                            raster_sizes)
+                        raster_fig.suptitle(f"ep {ep}  decision {step}  "
+                                            f"action {action}  r={r:+.2f}",
+                                            fontsize=9)
+                        raster_frames.append(captureFrame(raster_fig))
+                # env.render() must come last: it makes its own figure current,
+                # which is what the un-argumented captureFrame() below reads.
+                env.render()
+                replay_frames.append(captureFrame())
+
+            if args.plot_every and ep % args.plot_every == 0 and step == 1:
+                spikes_ = {l: spikes[l].get("s").view(gran, -1) for l in spikes}
+                spike_ims, spike_axes = plot_spikes(spikes_, ims=spike_ims,
+                                                    axes=spike_axes)
+
+            if step % 25 == 0:
+                print(f"  step {step} ({time.time() - clock:.2f}s) "
+                      f"r={r:+.3f}")
+                clock = time.time()
+
+        # create a sliding history window of past rewards
+        if len(past_performances) < 25:
+            past_performances.insert(0,avg_reward/100)
+        else:
+            past_performances.insert(0,avg_reward/100)
+            past_performances.pop()
+            avg_perf = sum(past_performances)/len(past_performances)
+            print(f"AVERAGE REWARD PAST 25: {avg_perf}", flush=True)
+
+        if net.reward_fn is not None:
+            net.reward_fn.update(accumulated_reward=total_reward, steps=step)
+
+        # plotting + diagnostics code
+        print(f"Episode {ep}: total reward {total_reward:.2f}"
+              f"intercepts {intercepts} "
+              f"target visible {visible_steps / max(1, step):.0%} | "
+              f"AC active {ac_frac_sum / max(1, step):.1%}, "
+              f"MC active {mc_frac_sum / max(1, step):.1%} | ")
+        os.makedirs(OUT_FILE_PATH, exist_ok=True)
+        if capturing and replay_frames:
+            saveReplayGIF(replay_frames,
+                          os.path.join(OUT_FILE_PATH,
+                                       f"{replay_prefix}_ep{ep:05d}.gif"),
+                          fps=replay_fps)
+        if capturing and raster_frames:
+            # Frame count matches the env GIF (both open on the initial state), so
+            # frame i is the same instant in both and they play in lockstep.
+            saveReplayGIF(raster_frames,
+                          os.path.join(OUT_FILE_PATH,
+                                       f"{replay_prefix}_raster_ep{ep:05d}.gif"),
+                          fps=replay_fps)
+        if capturing and raster_windows:
+            plotRasterTimeline(
+                raster_windows, args.raster_layers, gran, ep,
+                os.path.join(OUT_FILE_PATH,
+                             f"{replay_prefix}_rastertl_ep{ep:05d}.png"))
+        if capturing and raster_fig is not None:
+            plt.close(raster_fig)
+        if weight_features is not None and ep % render_every == 0:
+            plotWeightGraphs(weight_features, ep)
+            plotMotorWeightPolar(feat_ac_mc.value, last_active_ac, ep)
+        if args.write and rfname:
+            with open(rfname, "ab") as f:
+                np.savetxt(f, rewards, delimiter=",", fmt="%.6f")
+        if pfname:
+            with open(pfname, "a+") as f:
+                f.write(("," if ep else "") + str(intercepts))
+        if ep % args.fcycle == 0:
+            env.cycleOutFiles()
+
+    # use the average performance of final 25 as the fitness score
+    if not past_performances:
+        return 0.0
+    return sum(past_performances)/len(past_performances)
 
 
+def run_task(param, task_args=None):
+    """
+    param      -- one Para-HADES candidate. param['param'] holds the decoded
+                  genes: w_ac_mc plus the six/seven scalers.
+    task_args  -- the Para-HADES slurm namespace (path, agent_idx, ...). It is
+                  NOT the config namespace; deliberately not named `args` so it
+                  cannot shadow the module-level parser defaults, which are what
+                  every architecture knob is read from.
+    Returns {'fitnessScore': float, ...}.
+    """
+    global OUT_FILE_PATH
 
-# CHECK- potential issue 1: param[param] is not in cfg
-# sets cfg to store the param file + default vals
-def buildConfig(param):
-    """Merge main.DotTracing from the GA candidate over DEFAULT_CFG."""
-    cfg = copy.deepcopy(DEFAULT_CFG)
-    user = {}
-    if isinstance(param, dict):
-        user = (param.get("main", {}) or {}).get("DotTracing", {}) or {}
-    unknown = [k for k in user if k not in cfg]
-    if unknown:
-        print(f"[cfg] WARNING unknown DotTracing keys ignored: {unknown}", flush=True)
-    for k, v in user.items():
-        if k in cfg:
-            cfg[k] = v
-    cfg["moveChoices"] = 9 if cfg["diag"] else 5
-    cfg["n_mc"] = cfg["moveChoices"] * cfg["mc_pop"]
-    return cfg
+    # Per-candidate output folder: parallel agents must not share one.
+    if task_args is not None and getattr(task_args, "path", None):
+        OUT_FILE_PATH = os.path.join(
+            task_args.path, "dotTracing_out",
+            f"agent{getattr(task_args, 'agent_idx', 0)}"
+            f"_test{getattr(task_args, 'agent_test_num', 0)}") + os.sep
+    os.makedirs(OUT_FILE_PATH, exist_ok=True)
 
+    # Seed here, not at import: the module is imported once but run_task is called
+    # once per candidate, so import-time seeding never re-seeds between candidates.
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
-def geneLengths(cfg):
-    """Gene vector length per plastic pathway. These are the YAML array sizes."""
-    return {
-        "gc_ac": cfg["ac"] * cfg["gc_ac_convergence"],
-        "ac_mc": cfg["n_mc"] * cfg["ac_mc_convergence"],
-    }
+    # ---- decode the scalar genes ------------------------------------------ #
+    s_gc_pc1   = geneScalar(param, "scaler_gc_pc1")
+    s_gc_pc2   = geneScalar(param, "scaler_gc_pc2")
+    s_pc_ac1   = geneScalar(param, "scaler_pc_ac1")
+    s_pc_ac2   = geneScalar(param, "scaler_pc_ac2")
+    s_ac_mc    = geneScalar(param, "scaler_ac_mc")
+    s_inhib_ac = geneScalar(param, "scaler_inhib_ac")
+    s_inhib_mc = geneScalar(param, "scaler_inhib_mc")
+    print(f"[gene] gc_pc={s_gc_pc1:.3f}/{s_gc_pc2:.3f}  "
+          f"pc_ac={s_pc_ac1:.3f}/{s_pc_ac2:.3f}  ac_mc={s_ac_mc:.3f}  "
+          f"inhib_ac={s_inhib_ac:.3f}  inhib_mc={s_inhib_mc:.3f}", flush=True)
 
+    dim = args.dim
+    # store all coordinate pairs
+    world_xy = np.array([(r, c) for r in range(dim) for c in range(dim)],
+                        dtype=np.float32)               
+    # centre the lattice on the board so rotations pivot about the middle
+    board_centre = np.array([(dim - 1) / 2.0, (dim - 1) / 2.0], dtype=np.float32)
+    world_rel = world_xy - board_centre                 
+    extent = dim / 2.0
 
+    gc_fields, gc_meta = [], []
 
-def getLocalView(obs, row, col, view_r):
-    """returns a 1-d egocentric patch around the agent, agent's own cell excluded."""
-    padded = np.pad(obs, view_r, mode="constant", constant_values=0)
-    patch = padded[row: row + 2 * view_r + 1, col: col + 2 * view_r + 1]
-    flat = patch.flatten()
-    center = view_r * (2 * view_r + 1) + view_r
-    return np.concatenate([flat[:center], flat[center + 1:]])
-
-
-def viewIndexToOffset(view_r):
-    """(drow, dcol) of every input index (coordinate relative to agent),
-        matching getLocalView's layout exactly."""
-    side = 2 * view_r + 1
-    center = view_r * side + view_r
-    offs = []
-    for k in range(side * side - 1):
-        cell = k if k < center else k + 1
-        pr, pc = divmod(cell, side)
-        offs.append((pr - view_r, pc - view_r))
-    return np.array(offs, dtype=np.float32)
-
-
-# --------------------------------------------------------------------------- #
-# GRID CELL LAYER (fixed projection -- never evolved, never plastic)
-# --------------------------------------------------------------------------- #
-def _hexLattice(spacing, rotation, phase, extent):
-    b1 = spacing * np.array([1.0, 0.0])
-    b2 = spacing * np.array([0.5, np.sqrt(3.0) / 2.0])
-    n = int(np.ceil(2.0 * extent / spacing)) + 2
-    ij = np.array(list(itertools.product(range(-n, n + 1), repeat=2)), dtype=np.float32)
-    pts = ij[:, :1] * b1 + ij[:, 1:] * b2
-    c, s = np.cos(rotation), np.sin(rotation)
-    R = np.array([[c, -s], [s, c]], dtype=np.float32)
-    pts = pts @ R.T + phase
-    keep = (np.abs(pts) <= extent + spacing).all(axis=1)
-    return pts[keep]
-
-
-_GC_CACHE = {}
-
-def buildGridCellProjection(view_r, scales, n_rot, n_off, g, k, device="cpu",
-                            cache=True):
-    """Create grid cell projection inpt->grid: hexagonal lattices of 2D Gaussians."""
-    key = (view_r, tuple(scales), n_rot, n_off, g, k, str(device))
-
-    if cache and key in _GC_CACHE:
-        return _GC_CACHE[key]
-
-    # viewing radius is 14
-    offs = viewIndexToOffset(view_r)
-    extent = float(view_r)
-
-    # n_rot is 7
-    rotations = [np.pi * i / max(1, n_rot) for i in range(n_rot)]
-
-    # 16 offsets
-    side = int(round(np.sqrt(n_off)))
-
-    cols, meta = [], []
-    # scales is [3, 5, 7, 11, 13]
-    for s in scales:
-        # vector setup for the hex lattice
-        spacing = s * g
-        d = (1.0 / k) * (spacing / 2.0)
+    for s in args.gc_scales:
+        spacing = s * args.gc_global_scale
+        d = (1.0 / args.gc_sharpness) * (spacing / 2.0)
         sigma = d / 3.0
+
         b1 = spacing * np.array([1.0, 0.0])
         b2 = spacing * np.array([0.5, np.sqrt(3.0) / 2.0])
-        for theta in rotations:
-            for a in range(side):
-                for b in range(side):
-                    phase = (a / side) * b1 + (b / side) * b2
-                    pts = _hexLattice(spacing, theta, phase, extent)
-                    d2 = ((offs[:, None, :] - pts[None, :, :]) ** 2).sum(-1)
+
+        n_tile = int(np.ceil(2.0 * extent / spacing)) + 2
+        ij = np.array(list(itertools.product(range(-n_tile, n_tile + 1), repeat=2)),
+                      dtype=np.float32)
+        lattice_base = ij[:, :1] * b1 + ij[:, 1:] * b2
+
+        for r_i in range(7): # 7 rotations
+            theta = np.pi * r_i / 7
+            cos_t, sin_t = np.cos(theta), np.sin(theta)
+            R = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float32)
+            lattice_rot = lattice_base @ R.T
+
+            # 4 phase shifts for up and down
+            for a in range(4):
+                for b in range(4):
+                    phase = (a / 4) * b1 + (b / 4) * b2
+                    pts = lattice_rot + phase
+                    # find out which points to keep (within the 28x28 grid)
+                    keep = (np.abs(pts) <= extent + spacing).all(axis=1)
+                    pts = pts[keep]
+
+                    # create gaussians
+                    d2 = ((world_rel[:, None, :] - pts[None, :, :]) ** 2).sum(-1)
                     field = np.exp(-d2.min(axis=1) / (2.0 * sigma ** 2))
-                    field[field < 0.01] = 0.0
-                    cols.append(field.astype(np.float32))
-                    meta.append((s, theta, a, b))
+                    field[field < 0.01] = 0.0 # cut off the gaussian tail
+                    gc_fields.append(field.astype(np.float32))
+                    gc_meta.append((s, theta, a, b))
 
-    W = np.stack(cols, axis=1)
-    peak = W.max(axis=0, keepdims=True)
-    peak[peak == 0] = 1.0
-    out = (torch.from_numpy(W).to(device), torch.from_numpy(peak).to(device), meta)
-    if cache:
-        _GC_CACHE[key] = out
-    return out
-
-
-def gcRates(view_vec, W_grid, peak, max_rate):
-    drive = view_vec @ W_grid
-    drive = (drive / peak.squeeze(0)).clamp(0.0, 1.0)
-    drive[drive < 0.01] = 0.0
-    return drive * max_rate
-
-
-# --------------------------------------------------------------------------- #
-# Connectivity. Convergence-based, NOT probabilistic -- the gene length has to
-# be deterministic or EVOL and the network disagree about what the vector means.
-# --------------------------------------------------------------------------- #
-
-# connect each ac neuron to 25 randomly selected grid cell neuron
-def buildConvergenceMask(n_pre, n_post, convergence, seed, device):
-    """
-    Each postsynaptic neuron receives from exactly K distinct presynaptic
-    neurons. Returns (mask, src_idx) where src_idx is (K, n_post).
-
-    Gene ordering is src_idx-major: gene.view(K, n_post) indexes exactly the
-    live synapses, so applyGene and extractGene are exact inverses.
-    """
-    K = int(min(convergence, n_pre))
-    g = torch.Generator().manual_seed(int(seed))
-    src = torch.stack(
-        [torch.randperm(n_pre, generator=g)[:K] for _ in range(n_post)], dim=1
-    )                                                    # (K, n_post)
-    mask = torch.zeros(n_pre, n_post)
-    cols = torch.arange(n_post).unsqueeze(0).expand(K, n_post)
-    mask[src, cols] = 1.0
-    return mask.to(device), src.to(device)
-
-
-def applyGeneToWeights(weight_tensor, src_idx, gene_vec, w_min, w_max):
-    """Write a flat gene vector into the live synapses of a weight matrix."""
-    K, n_post = src_idx.shape
-    expected = K * n_post
-    v = torch.as_tensor(np.asarray(gene_vec, dtype=np.float32),
-                        device=weight_tensor.device).flatten()
-    if v.numel() != expected:
-        raise ValueError(
-            f"gene length {v.numel()} != expected {expected} "
-            f"(K={K}, n_post={n_post}). Regenerate the YAML array size with "
-            f"`python dot_tracingtask.py --gene_lengths`."
-        )
-    cols = torch.arange(n_post, device=weight_tensor.device).unsqueeze(0).expand(K, n_post)
-    with torch.no_grad():
-        weight_tensor.zero_()
-        weight_tensor[src_idx, cols] = v.view(K, n_post).clamp(w_min, w_max)
-    return weight_tensor
-
-#not used 
-def extractGeneFromWeights(weight_tensor, src_idx):
-    """Inverse of applyGeneToWeights -- used for lamarckian inheritance."""
-    K, n_post = src_idx.shape
-    cols = torch.arange(n_post, device=weight_tensor.device).unsqueeze(0).expand(K, n_post)
-    with torch.no_grad():
-        return weight_tensor[src_idx, cols].reshape(-1).detach().cpu().numpy()
-
-
-def acPlaceCentres(W_grid, gc_ac_mask, view_r):
-    eff = W_grid @ gc_ac_mask
-    idx = eff.argmax(dim=0).cpu().numpy()
-    offs = viewIndexToOffset(view_r)
-    return torch.from_numpy(offs[idx]).float()
-
-
-def buildRecurrent(mode, centres, n_ac, inh, radius, device, seed=0):
-    if mode == "none":
-        return None
-    if mode == "random":
-        g = torch.Generator().manual_seed(int(seed))
-        signs = (torch.rand(n_ac, n_ac, generator=g) < 0.45).float() * 2 - 1
-        W = torch.rand(n_ac, n_ac, generator=g) * signs
-    else:  # local: short-range excitation, broad surround inhibition
-        d = torch.cdist(centres, centres)
-        exc = torch.exp(-(d ** 2) / (2 * radius ** 2))
-        W = exc - inh * (1.0 - exc)
-    W.fill_diagonal_(0.0)
-    return W.to(device)
-
-
-# --------------------------------------------------------------------------- #
-# Critic
-# --------------------------------------------------------------------------- #
-class Critic:
-    """
-    critic_mode='loss' -- the paper's form, transposed to pursuit:
-        loss(t)  = sqrt(distance^2 + eta_closing * closing_rate^2)
-        reward   = loss(t-1) - loss(t)
-        -- positivity bias 
-
-    critic_mode='env' -- the alignment-scaled reward from the original script.
-    """
-
-    def __init__(self, cfg):
-        self.mode = cfg["critic_mode"]
-        self.max_reward = float(cfg["max_reward"])
-        self.eta_pos = float(cfg["eta_positivity"])
-        self.eta_closing = float(cfg["eta_closing"])
-        self.gain = float(cfg["critic_gain"])
-        self.success_eps = float(cfg["success_eps"])
-
-        # Distance normalization. WITHOUT THIS THE CRITIC SATURATES: raw pixel
-        # distances on a 28x28 grid give per-step loss deltas of order 1-3,
-        # which eta_positivity multiplies to 5-15, so every single step clips
-        # to +/-max_reward and the critic degenerates into a sign function.
-        # MSTDPET modulates by reward MAGNITUDE, so that throws the graded part
-        # of the learning signal away. The paper avoids this only because
-        # CartPole's state variables are radians (~0.26 max).
-        # Dividing by the grid diagonal puts loss in [0,1] and deltas in the
-        # range the positivity bias and the clip were designed for.
-        scale = cfg.get("critic_dist_scale", "auto")
-        if scale in (None, "auto"):
-            scale = float(np.sqrt(2.0) * cfg["dim"])
-        self.dist_scale = max(float(scale), 1e-8)
-
-        self.prev_loss = None
-
-    def reset(self):
-        self.prev_loss = None
-
-    def _loss(self, dist, closing):
-        d = dist / self.dist_scale
-        c = closing / self.dist_scale
-        return float(np.sqrt(d ** 2 + self.eta_closing * c ** 2))
-
-    def __call__(self, *, dist, closing, moved, intercept, alignment):
-        if self.mode == "env":
-            scale = 0.5 + 0.5 * alignment
-            r = closing * ((0.5 + scale) if closing >= 0 else (1.5 - scale))
-            r += 0.2 * alignment
-            if intercept:
-                r += 20.0
-            return float(r)
-
-        # ---- paper form ----
-        loss = self._loss(dist, closing)
-        if self.prev_loss is None:
-            self.prev_loss = loss
-            return 0.0
-
-        if not moved:
-            raw = -self.max_reward / self.eta_pos
-        elif loss < self.success_eps or intercept:
-            raw = self.max_reward / self.eta_pos
-        elif self.prev_loss < self.success_eps:
-            raw = 0.0
-        else:
-            raw = self.prev_loss - loss
-
-        self.prev_loss = loss
-        biased = raw * self.eta_pos if raw > 0 else raw
-        return float(np.clip(biased * self.gain, -self.max_reward, self.max_reward))
-
-
-# --------------------------------------------------------------------------- #
-# Weight normalization. MANDATORY when STDP is live -- otherwise weights grow
-# without bound and the network goes epileptic.
-# --------------------------------------------------------------------------- #
-class WeightNormalizer:
-    """
-    CRITICAL: reception balancing renormalizes to the sum of the OFFSPRING's
-    starting weights (the EVOL-issued gene), NOT to a global w_0. If it snapped
-    back to a global constant it would silently undo the EVOL perturbation and
-    the whole method would degenerate to plain STDP-RL.
-    """
-
-    def __init__(self, cfg, weight_tensor, mask):
-        self.cfg = cfg
-        self.mask = mask
-        self.w_min, self.w_max = float(cfg["w_min"]), float(cfg["w_max"])
-        with torch.no_grad():
-            self.target_reception = weight_tensor.sum(0).clone()      # (n_post,)
-            self.start_transmission = weight_tensor.sum(1).clone()    # (n_pre,)
-            self.start_transmission.clamp_(min=1e-8)
-        self.step_count = 0
-        self.rate_hist_ac, self.rate_hist_mc = [], []
-
-    def clamp(self, w):
-        with torch.no_grad():
-            w.mul_(self.mask).clamp_(self.w_min, self.w_max)
-
-    def scale_delta(self, w_before, w_after):
-        """
-        Transmission-side normalization: scale each synapse's weight CHANGE by
-        that presynaptic neuron's total outgoing weight relative to its start.
-        A synapse whose source already transmits a lot gets its potentiation
-        damped and its depression amplified.
-        """
-        if not self.cfg["norm_transmission"]:
-            return
-        with torch.no_grad():
-            cur = w_after.sum(1).clamp(min=1e-8)
-            ratio = (self.start_transmission / cur).clamp(
-                self.cfg["transmission_min"], self.cfg["transmission_max"])
-            delta = (w_after - w_before) * ratio.unsqueeze(1)
-            w_after.copy_(w_before + delta)
-
-    def step(self, w, ac_rate=None, mc_rate=None):
-        self.step_count += 1
-        cfg = self.cfg
-
-        if ac_rate is not None:
-            self.rate_hist_ac.append(float(ac_rate))
-            self.rate_hist_mc.append(float(mc_rate))
-            if len(self.rate_hist_ac) > cfg["rate_window"]:
-                self.rate_hist_ac.pop(0)
-                self.rate_hist_mc.pop(0)
-
-        # homeostatic gain control: nudge the reception TARGET, not the weights
-        if (cfg["norm_homeostasis"] and self.rate_hist_mc
-                and self.step_count % cfg["homeostasis_every"] == 0):
-            obs = float(np.mean(self.rate_hist_mc))
-            tgt = float(cfg["rate_target_mc"])
-            if obs > tgt:
-                self.target_reception.mul_(1.0 - cfg["homeostasis_scale"])
-            elif obs < tgt:
-                self.target_reception.mul_(1.0 + cfg["homeostasis_scale"])
-
-        # reception balancing: restore each postsynaptic neuron's summed input
-        if cfg["norm_reception"] and self.step_count % cfg["reception_every"] == 0:
-            with torch.no_grad():
-                cur = w.sum(0).clamp(min=1e-8)
-                w.mul_((self.target_reception / cur).unsqueeze(0))
-        self.clamp(w)
-
-
-# --------------------------------------------------------------------------- #
-# Action selection
-# --------------------------------------------------------------------------- #
-def wtaAction(mc_spikes, n_actions, eps, rng):
-    """Returns (action, moved) -- 'moved' is False when the tie forced a coin flip."""
-    if eps > 0 and rng.random() < eps:
-        return int(rng.integers(0, n_actions)), False
-    counts = mc_spikes.sum(0)
-    agg = torch.stack([p.sum() for p in torch.chunk(counts, n_actions)])
-    if agg.max() == 0:
-        return int(rng.integers(0, n_actions)), False
-    top = (agg == agg.max()).nonzero().flatten()
-    if top.numel() > 1:                      # paper: random move on a tie
-        return int(top[rng.integers(0, top.numel())].item()), False
-    return int(agg.argmax().item()), True
-
-
-def softmaxAction(mc_spikes, n_actions, rng):
-    counts = mc_spikes.sum(0)
-    agg = torch.stack([p.sum() for p in torch.chunk(counts, n_actions)])
-    return int(torch.multinomial(torch.softmax(agg.float(), dim=0), 1).item()), True
-
-
-# run a single episode
-def runEpisode(net, env, spikes, cfg, W_grid, peak, feat_ac_mc, mask,
-               normalizer, critic, rng, device, learning=True, eps=0.0,
-               episode_seed=None):
-    gran, dt, view_r = cfg["granularity"], cfg["dt"], cfg["view_r"]
-    n_actions = env.action_space.n
-
-    net.reset_state_variables()
-    if episode_seed is not None:
-        # DotSimulator.reset() takes no seed argument and reseeds the stdlib
-        # `random` module from self.seed, so the seed must be set on the
-        # instance. Seeding np.random here does nothing -- the env never uses it.
-        env.seed = int(episode_seed)
-    env.reset()
-    critic.reset()
-
-    total_reward, intercepts, step = 0.0, 0, 0
-    action = int(rng.integers(0, n_actions))
-    done = False
-
-    while not done:
-        step += 1
-        # calculate the distance between the agent and the target dot before taking a step
-        pr, pc = env.netDot.row[0], env.netDot.col[0]
-        tr0, tc0 = env.dots[0].row[0], env.dots[0].col[0]
-        prev_dist = float(np.hypot(pr - tr0, pc - tc0))
-
-        obs, _, done, intercept = env.step(action)
-
-        net_obs = obs.copy()
-        net_obs[env.netDot.row, env.netDot.col] = 0.0
-        view = torch.as_tensor(
-            getLocalView(net_obs, env.netDot.row[0], env.netDot.col[0], view_r),
-            dtype=torch.float32, device=device)
-
-        cr, cc = env.netDot.row[0], env.netDot.col[0]
-        tr, tc = env.dots[0].row[0], env.dots[0].col[0]
-        curr_dist = float(np.hypot(cr - tr, cc - tc))
-        closing = prev_dist - curr_dist
-
-        dr_p, dc_p = tr - pr, tc - pc
-        dr_m, dc_m = cr - pr, cc - pc
-        dmag, mmag = np.hypot(dr_p, dc_p), np.hypot(dr_m, dc_m)
-        alignment = 0.0 if (mmag < 1e-8 or dmag < 1e-8) else float(
-            np.clip((dr_m * dr_p + dc_m * dc_p) / (dmag * mmag), -1, 1))
-
-        r = critic(dist=curr_dist, closing=closing, moved=True,
-                    intercept=bool(intercept), alignment=alignment)
-        reward = torch.tensor(r, dtype=torch.float32, device=device)
-
-        rates = gcRates(view, W_grid, peak, cfg["gc_max_rate"])
-        inputs = {LAYER_GC: poisson(rates.unsqueeze(0), gran, dt, device=device)}
-
-        w_before = feat_ac_mc.value.detach().clone() if learning else None
-        net.run(inputs=inputs, time=gran, reward=reward)
-
-        mc_s = spikes[LAYER_MC].get("s").squeeze()
-        ac_s = spikes[LAYER_AC].get("s").squeeze()
-        ac_rate = float(ac_s.float().mean().item()) * 1000.0 / dt
-        mc_rate = float(mc_s.float().mean().item()) * 1000.0 / dt
-
-        if learning:
-            normalizer.scale_delta(w_before, feat_ac_mc.value)
-            normalizer.step(feat_ac_mc.value, ac_rate=ac_rate, mc_rate=mc_rate)
-
-        if cfg["select"] == "wta":
-            action, _ = wtaAction(mc_s, n_actions, eps, rng)
-        else:
-            action, _ = softmaxAction(mc_s, n_actions, rng)
-
-        total_reward += r
-        intercepts += int(bool(intercept))
-
-    return dict(total_reward=total_reward, intercepts=intercepts, steps=step)
-
-
-# build network based on the cfg set by defaults + YAML file
-def buildNetwork(cfg, device):
-    _lazy_imports()
-    seed = int(cfg["model_seed"])
-    torch.manual_seed(seed)
-
-    net = Network(dt=cfg["dt"])
-    inpt_n = (2 * cfg["view_r"] + 1) ** 2 - 1
-
-    W_grid, peak, _ = buildGridCellProjection(
-        cfg["view_r"], cfg["gc_scales"], cfg["gc_rotations"], cfg["gc_offsets"],
-        cfg["gc_global_scale"], cfg["gc_sharpness"], device=device,
-        cache=cfg["cache_gc"])
+    W_grid_np = np.stack(gc_fields, axis=1)       
+    peak_np = W_grid_np.max(axis=0, keepdims=True)
+    peak_np[peak_np == 0] = 1.0
+    # this weights grid is the weigths of the grid cells, which is 
+    # passed into the simulator
+    # grid cell weights are from the gaussians
+    W_grid = torch.from_numpy(W_grid_np).to(DEVICE)
+    peak = torch.from_numpy(peak_np).to(DEVICE)
     n_gc = W_grid.shape[1]
 
-    gc = Input(n=n_gc, shape=[1, 1, 1, 1, n_gc], traces=True)
-    ac = LIFNodes(n=cfg["ac"], traces=True, rest=-64.0, reset=-70.0,
-                  thresh=-45.0, refrac=1, tc_decay=20.0, tc_trace=20.0)
-    mc = LIFNodes(n=cfg["n_mc"], traces=True, rest=-64.0, reset=-64.0,
-                  thresh=-49.0, refrac=0, tc_decay=20.0, tc_trace=20.0)
+    net = Network(dt=args.dt)
+    gc_a = Input(n=n_gc, shape=[1, 1, 1, 1, n_gc], traces=True)
+    gc_t = Input(n=n_gc, shape=[1, 1, 1, 1, n_gc], traces=True)
 
-    net.add_layer(gc, name=LAYER_GC)
-    net.add_layer(ac, name=LAYER_AC)
-    net.add_layer(mc, name=LAYER_MC)
+    # agent place cells
+    pc_a = LIFNodes(n=args.n_pc, traces=True,
+                    rest=-64.0, reset=-70.0, thresh=-25.0,
+                    refrac=1, tc_decay=20.0, tc_trace=20.0,
+                    lbound=args.pc_lbound)
+    # target place cells
+    pc_t = LIFNodes(n=args.n_pc, traces=True,
+                    rest=-64.0, reset=-70.0, thresh=-25.0,
+                    refrac=1, tc_decay=20.0, tc_trace=20.0,
+                    lbound=args.pc_lbound)
 
-    # --- GC -> AC : fixed. Evolved only if 'gc_ac' is in cfg['plastic']. ---
-    gc_ac_mask, gc_ac_src = buildConvergenceMask(
-        n_gc, cfg["ac"], cfg["gc_ac_convergence"], seed, device)
-    
-    g = torch.Generator().manual_seed(seed + 7)
-    W_gc_ac = (gc_ac_mask.cpu() * torch.rand(n_gc, cfg["ac"], generator=g)).to(device)
-    fan_in = gc_ac_mask.sum(0).mean().clamp(min=1.0)
-    W_gc_ac = W_gc_ac / fan_in.sqrt() * cfg["ac_gain"]
-    feat_gc_ac = Weight(name="w_gc_ac", value=W_gc_ac)
+    ac = LIFNodes(n=args.ac, traces=True,
+                  rest=-64.0, reset=-70.0, thresh=-50.0,
+                  refrac=1, tc_decay=20.0, tc_trace=20.0,
+                  lbound=args.ac_lbound)
+
+    # neurons 0-99: pause, 100-199: up, 200-299: right, 300-399: down, 400-499: left
+    n_mc = moveChoices * args.mc_pop
+    mc = LIFNodes(n=n_mc, traces=True,
+                  rest=-64.0, reset=-64.0, thresh=-55.0,
+                  refrac=0, tc_decay=20.0, tc_trace=20.0,
+                  lbound=args.mc_lbound)
+
+    net.add_layer(gc_a, name=LAYER_GCA)
+    net.add_layer(gc_t, name=LAYER_GCT)
+    net.add_layer(pc_a, name=LAYER_PCA)
+    net.add_layer(pc_t, name=LAYER_PCT)
+    net.add_layer(ac,   name=LAYER_AC)
+    net.add_layer(mc,   name=LAYER_MC)
+
+    # grid cell to place cell connections
+    # 5% sparsity
+    gen_a = torch.Generator(device="cpu").manual_seed(args.seed + 10)
+    gc_pc_mask_a = (torch.rand(n_gc, args.n_pc, generator=gen_a)
+                    < args.gc_pc_sparsity).float().to(DEVICE)
+    W_gc_pc_a = gc_pc_mask_a * torch.rand(n_gc, args.n_pc, device=DEVICE)
+    W_gc_pc_a = (W_gc_pc_a / gc_pc_mask_a.sum(0).mean().clamp(min=1.0).sqrt()
+                 ) * s_gc_pc1
+
+    gen_t = torch.Generator(device="cpu").manual_seed(args.seed + 11)
+    gc_pc_mask_t = (torch.rand(n_gc, args.n_pc, generator=gen_t)
+                    < args.gc_pc_sparsity).float().to(DEVICE)
+    W_gc_pc_t = gc_pc_mask_t * torch.rand(n_gc, args.n_pc, device=DEVICE)
+    W_gc_pc_t = (W_gc_pc_t / gc_pc_mask_t.sum(0).mean().clamp(min=1.0).sqrt()
+                 ) * s_gc_pc2
+
+    feat_gc_pc_a = Weight(name="w_gc_pc_a", value=W_gc_pc_a)
     net.add_connection(
-        MulticompartmentConnection(source=gc, target=ac,
-                                   pipeline=[feat_gc_ac], device=device),
-        source=LAYER_GC, target=LAYER_AC)
+        MulticompartmentConnection(source=gc_a, target=pc_a,
+                                   pipeline=[feat_gc_pc_a], device=DEVICE),
+        source=LAYER_GCA, target=LAYER_PCA)
 
-    # --- AC -> AC : structured local inhibition, fixed ---
-    feat_rec = None
-    if cfg["rec_mode"] != "none":
-        centres = acPlaceCentres(W_grid, gc_ac_mask, cfg["view_r"])
-        W_rec = buildRecurrent(cfg["rec_mode"], centres, cfg["ac"],
-                               cfg["rec_inh"], cfg["rec_radius"], device, seed)
-        if W_rec is not None:
-            feat_rec = Weight(name="w_rec", value=W_rec)
-            net.add_connection(
-                MulticompartmentConnection(source=ac, target=ac,
-                                           pipeline=[feat_rec], device=device),
-                source=LAYER_AC, target=LAYER_AC)
+    feat_gc_pc_t = Weight(name="w_gc_pc_t", value=W_gc_pc_t)
+    net.add_connection(
+        MulticompartmentConnection(source=gc_t, target=pc_t,
+                                   pipeline=[feat_gc_pc_t], device=DEVICE),
+        source=LAYER_GCT, target=LAYER_PCT)
 
-    # --- AC -> MC : the plastic + evolved pathway ---
-    ac_mc_mask, ac_mc_src = buildConvergenceMask(
-        cfg["ac"], cfg["n_mc"], cfg["ac_mc_convergence"], seed + 1, device)
-    mid = 0.5 * (cfg["w_min"] + cfg["w_max"])
-    W_ac_mc = ac_mc_mask * mid
-    if cfg["stdp_enabled"]:
-        feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc,
-                            learning_rule=MSTDPET, nu=[cfg["nu"], cfg["nu"]],
-                            range=[cfg["w_min"], cfg["w_max"]])
+    # PLACE to ASSOCIATION connection 10% sparsity
+    dense_fan = float(2 * args.n_pc)
+    pc_ac_a_mask = (torch.rand(args.n_pc, args.ac, generator=gen_a) 
+                    <= args.pc_ac_sparsity).float().to(DEVICE)
+    # decrease agent place cell influence slightly
+    W_pc_ac_a = (pc_ac_a_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
+                 / np.sqrt(dense_fan)) * s_pc_ac1
+    pc_ac_t_mask = (torch.rand(args.n_pc, args.ac, generator=gen_t) 
+                        <= args.pc_ac_sparsity).float().to(DEVICE)
+    W_pc_ac_t = (pc_ac_t_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
+                 / np.sqrt(dense_fan)) * s_pc_ac2
+
+    feat_pc_ac_a = Weight(name="w_pc_ac_a", value=W_pc_ac_a)
+    net.add_connection(
+        MulticompartmentConnection(source=pc_a, target=ac,
+                                   pipeline=[feat_pc_ac_a], device=DEVICE),
+        source=LAYER_PCA, target=LAYER_AC)
+
+    feat_pc_ac_t = Weight(name="w_pc_ac_t", value=W_pc_ac_t)
+    net.add_connection(
+        MulticompartmentConnection(source=pc_t, target=ac,
+                                   pipeline=[feat_pc_ac_t], device=DEVICE),
+        source=LAYER_PCT, target=LAYER_AC)
+
+    # Recurrent association layer connection reservoir, no learning done
+    rec_gen = torch.Generator(device="cpu").manual_seed(args.seed)
+    W_rec = torch.randn(args.ac, args.ac, generator=rec_gen)
+    # normalize each by sum of their columns and mult by scale factor
+    # W_rec = W_rec / W_rec.abs().sum(0, keepdim=True).clamp(min=1e-6) 
+    # YAML allows scaler_inhib_ac down to 0.0, and this is a DIVISOR, so clamp:
+    # at 0 the recurrent weights blow up to inf and the whole episode goes NaN.
+    W_rec = W_rec / max(s_inhib_ac, 1e-3)
+    W_rec.fill_diagonal_(0.0)
+    feat_rec = Weight(name="w_rec", value=W_rec.to(DEVICE))
+    net.add_connection(
+        MulticompartmentConnection(source=ac, target=ac,
+                                   pipeline=[feat_rec], device=DEVICE),
+        source=LAYER_AC, target=LAYER_AC)
+
+    # association to motor layer, the only learning layer
+    ac_mc_gen = torch.Generator(device="cpu").manual_seed(args.seed + 4)
+    ac_mc_mask_gen = (torch.rand(args.ac, n_mc, generator=ac_mc_gen)
+                  < args.ac_mc_sparsity).to(DEVICE) # 20% sparsity for ac->mc
+
+    ac_mc_mask = Mask(name='ac_mc_mask', value=ac_mc_mask_gen)
+
+    # The w_ac_mc gene is one value per (AC neuron, ACTION) -- args.ac * moveChoices
+    # -- not per (AC neuron, MC neuron). Each value is broadcast across the mc_pop
+    # neurons of its action subpopulation, so EVOL searches args.ac * moveChoices
+    # dimensions (5000 here) while MSTDPET still refines all args.ac * n_mc synapses
+    # individually over the lifetime. A full per-synapse gene is also accepted.
+    n_gene_action = args.ac * moveChoices
+    n_gene_dense = args.ac * n_mc
+    raw = np.asarray(param["param"]["w_ac_mc"], dtype=np.float32).ravel()
+    if raw.size == n_gene_action:
+        g = torch.from_numpy(
+            geneArray(param, "w_ac_mc", n_gene_action)).to(DEVICE)
+        W_ac_mc = g.view(args.ac, moveChoices).repeat_interleave(args.mc_pop, dim=1)
+    elif raw.size == n_gene_dense:
+        g = torch.from_numpy(
+            geneArray(param, "w_ac_mc", n_gene_dense)).to(DEVICE)
+        W_ac_mc = g.view(args.ac, n_mc)
     else:
-        feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc)
+        raise ValueError(
+            f"gene 'w_ac_mc' has {raw.size} values. With ac={args.ac}, "
+            f"mc_pop={args.mc_pop}, moveChoices={moveChoices} it must be "
+            f"array: [{n_gene_action}] (per action, broadcast) or "
+            f"array: [{n_gene_dense}] (per synapse). Fix task_dotTracing.yaml."
+        )
+    # apply the evolved scaling number to the acmc weight
+    W_ac_mc = ac_mc_mask_gen * W_ac_mc * s_ac_mc
+ 
+    feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc, range=[0,5],
+                        learning_rule=MSTDPET, nu=[args.nu, args.nu])
     net.add_connection(
         MulticompartmentConnection(source=ac, target=mc,
-                                   pipeline=[feat_ac_mc], device=device),
+                                   pipeline=[feat_ac_mc,ac_mc_mask], device=DEVICE),
         source=LAYER_AC, target=LAYER_MC)
 
-    net.to(device)
+    # MOTOR opponent inhibition (MC -> MC, frozen)
+    feat_mc_opp = None
+    W_mc_opp = torch.zeros(n_mc, n_mc, device=DEVICE)
+    # scaler_inhib_mc is declared in the YAML as min -5.0 / max 0.0, i.e. the gene
+    # is ALREADY negative. Negating it here (as the original line did) would make
+    # opponent pairs excite each other, so use it as-is.
+    w_opp = s_inhib_mc
+    for a, b in OPPONENT_PAIRS: # two pairs - up down and right left
+        sa = slice(a * args.mc_pop, (a + 1) * args.mc_pop)
+        sb = slice(b * args.mc_pop, (b + 1) * args.mc_pop)
+        W_mc_opp[sa, sb] = w_opp      # a inhibits b
+        W_mc_opp[sb, sa] = w_opp      # b inhibits a
+
+    feat_mc_opp = Weight(name="w_mc_opp", value=W_mc_opp)
+    net.add_connection(
+        MulticompartmentConnection(source=mc, target=mc,
+                                    pipeline=[feat_mc_opp], device=DEVICE),
+        source=LAYER_MC, target=LAYER_MC)
+
+    net.to(DEVICE)
+    weight_features = {"gc_pc_a": feat_gc_pc_a, "gc_pc_t": feat_gc_pc_t,
+                       "pc_ac_a": feat_pc_ac_a, "pc_ac_t": feat_pc_ac_t,
+                       "recurrent": feat_rec, "ac_mc": feat_ac_mc}
+    if feat_mc_opp is not None:
+        weight_features["mc_opp"] = feat_mc_opp
+
+    print(f"[arch] GC {n_gc} x2  ->  PC {args.n_pc} x2 (sparse "
+          f"{args.gc_pc_sparsity:.0%})  ->  AC {args.ac} (dense)  ->  MC {n_mc}")
+    print(f"[gate] view_r={args.view_r} on a {dim}x{dim} board: target is visible "
+          f"when Chebyshev distance <= {args.view_r}")
 
     spikes = {}
     for layer in net.layers:
         spikes[layer] = Monitor(net.layers[layer], state_vars=["s"],
-                                time=int(cfg["granularity"] / cfg["dt"]),
-                                device=device)
+                                time=int(args.granularity / args.dt), device=DEVICE)
         net.add_monitor(spikes[layer], name=layer)
-
-    handles = dict(
-        net=net, spikes=spikes, W_grid=W_grid, peak=peak,
-        feat_gc_ac=feat_gc_ac, gc_ac_mask=gc_ac_mask, gc_ac_src=gc_ac_src,
-        feat_ac_mc=feat_ac_mc, ac_mc_mask=ac_mc_mask, ac_mc_src=ac_mc_src,
-        feat_rec=feat_rec, n_gc=n_gc, inpt_n=inpt_n,
+ 
+    environment = DotSimulator(
+        args.steps, decay=args.decay, herrs=args.herrs, diag=args.diag,
+        randr=args.randr, write=args.write, mute=args.mute,
+        bound_hand=args.boundh, fit_func=args.fit_func, 
+        allow_stay=args.allow_stay, pandas=args.pandas, fpath=OUT_FILE_PATH,
     )
-    return handles
+    environment.reset()
 
-
-# main function called by ga task file
-def do_task(param):
-    """
-    param     -- one GA candidate dict. param['param']['w_ac_mc'] is the gene.
-                 param['main']['DotTracing'] is the config block.
-    Returns a dict with a scalar 'fitnessScore' (higher = better).
-    """
-    #import libraries
-    _lazy_imports()
-    t0 = time.time()
-    # cfg stores param configuration
-    cfg = buildConfig(param)
-    device = torch.device("cuda" if (torch.cuda.is_available() and cfg["gpu"])
-                          else "cpu")
-
-    H = buildNetwork(cfg, device)
-    net, spikes = H["net"], H["spikes"]
-
-    # ---------- load the EVOL gene into the plastic pathways ---------------- #
-    gene_block = (param or {}).get("param", {}) or {}
-    lengths = geneLengths(cfg)
-    loaded = []
-
-    # overwrite the default vals for EVOL weights
-    if "ac_mc" in cfg["plastic"]:
-        if "w_ac_mc" not in gene_block:
-            raise KeyError(
-                "cfg['plastic'] contains 'ac_mc' but the candidate has no "
-                "param['param']['w_ac_mc']. Add w_ac_mc to the YAML `param:` "
-                f"block with array: [{lengths['ac_mc']}]."
-            )
-        applyGeneToWeights(H["feat_ac_mc"].value, H["ac_mc_src"],
-                           gene_block["w_ac_mc"], cfg["w_min"], cfg["w_max"])
-        loaded.append("ac_mc")
-
-    if "gc_ac" in cfg["plastic"]:
-        if "w_gc_ac" not in gene_block:
-            raise KeyError(
-                "cfg['plastic'] contains 'gc_ac' but the candidate has no "
-                "param['param']['w_gc_ac']. Either add it to the YAML `param:` "
-                f"block with array: [{lengths['gc_ac']}], or remove 'gc_ac' "
-                "from `plastic:`."
-            )
-        applyGeneToWeights(H["feat_gc_ac"].value, H["gc_ac_src"],
-                           gene_block["w_gc_ac"], cfg["w_min"], cfg["w_max"])
-        loaded.append("gc_ac")
-
-    w_start = H["feat_ac_mc"].value.detach().clone()
-
-    # ---------- lifetime ---------------------------------------------------- #
-    normalizer = WeightNormalizer(cfg, H["feat_ac_mc"].value, H["ac_mc_mask"])
-    critic = Critic(cfg)
-    rng = np.random.default_rng(int(cfg["model_seed"]) + 1000)
-
-    # build dot simu environment
-    env = DotSimulator(
-        cfg["steps"], decay=cfg["decay"], herrs=cfg["herrs"], diag=cfg["diag"],
-        randr=cfg["randr"], write=False, mute=not cfg["verbose"],
-        bound_hand=cfg["bound_hand"], fit_func=cfg["fit_func"],
-        allow_stay=cfg["allow_stay"], pandas=False, fpath="./",
+    print("Training:")
+    environment.addFileSuffix("train")
+    train_fitness = runSimulator(
+        net, environment, spikes, args.trn_eps, W_grid, peak,
+        feat_ac_mc, gran=args.granularity,
+        rfname=genFileName("rew", "train"), pfname=genFileName("perf", "train"),
+        weight_features=weight_features, render_replays=args.render_replays,
+        render_every=args.render_every, replay_fps=args.replay_fps,
+        replay_prefix="replay_train", view_r=args.view_r, dim=dim,
     )
-    env.reset()
+    net.learning = False
+    print("Testing:")
+    environment.changeFileSuffix("train", "test")
+    fitness = runSimulator(
+        net, environment, spikes, args.tst_eps, W_grid, peak,
+        feat_ac_mc, gran=args.granularity,
+        rfname=genFileName("rew", "test"), pfname=genFileName("perf", "test"),
+        weight_features=weight_features, render_replays=args.render_replays,
+        render_every=args.render_every, replay_fps=args.replay_fps,
+        replay_prefix="replay_test", view_r=args.view_r, dim=dim,
+    )
 
-    net.learning = bool(cfg["stdp_enabled"])
-    eps = float(cfg["eps_start"])
-    per_ep = []
-
-    
-    for ep in range(int(cfg["episodes"])):
-        # if we want the episodes to be the same. by default, episodes are the same
-        if cfg["seed_mode"] == "common":
-            ep_seed = int(cfg["episode_seed_base"]) + ep
-        else:
-            # 'random': still varies per episode, but not shared across the
-            # population -- fitness comparisons pick up the extra variance.
-            ep_seed = int(rng.integers(0, 2 ** 31 - 1))
-        res = runEpisode(net, env, spikes, cfg, H["W_grid"], H["peak"],
-                         H["feat_ac_mc"], H["ac_mc_mask"], normalizer, critic,
-                         rng, device, learning=bool(cfg["stdp_enabled"]),
-                         eps=eps, episode_seed=ep_seed)
-        per_ep.append(res)
-        eps = max(cfg["eps_min"], eps * cfg["eps_decay"])
-        if cfg["verbose"]:
-            print(f"  [life] ep {ep:3d}  reward {res['total_reward']:+8.2f}  "
-                  f"intercepts {res['intercepts']:3d}", flush=True)
-
-    # ---------- frozen held-out evaluation (fitness variant iii) ------------ #
-    frozen = []
-    # testing, no stdp
-    if int(cfg["frozen_episodes"]) > 0:
-        net.learning = False
-        for ep in range(int(cfg["frozen_episodes"])):
-            ep_seed = int(cfg["episode_seed_base"]) + 90000 + ep
-            frozen.append(runEpisode(
-                net, env, spikes, cfg, H["W_grid"], H["peak"],
-                H["feat_ac_mc"], H["ac_mc_mask"], normalizer, critic, rng,
-                device, learning=False, eps=0.0, episode_seed=ep_seed))
-
-    # ---------- fitness ----------------------------------------------------- #
-    key = "intercepts" if cfg["fitness_metric"] == "intercepts" else "total_reward"
-    all_vals = [float(r[key]) for r in per_ep]
-    k = int(cfg["fitness_last_k"])
-    fitness = float(np.mean(all_vals)) if all_vals else 0.0
-
-    # ---------- STDP contribution diagnostic -------------------------------- #
-    w_end = H["feat_ac_mc"].value.detach()
-    dw = float(torch.linalg.vector_norm(w_end - w_start).item())
-    w0n = float(torch.linalg.vector_norm(w_start).item()) or 1.0
-    dw_rel = dw / w0n
-
-    # note: only the firnessScore key is used, other stuff might be useful though
-    outP = {
-        "fitnessScore": fitness,
-        "fit_mean_all": fitness,
-        "fit_last_k": float(np.mean(all_vals[-k:])) if all_vals else 0.0,
-        "fit_frozen": float(np.mean([r[key] for r in frozen])) if frozen else None,
-        "mean_reward": float(np.mean([r["total_reward"] for r in per_ep])) if per_ep else 0.0,
-        "mean_intercepts": float(np.mean([r["intercepts"] for r in per_ep])) if per_ep else 0.0,
-        "stdp_dw_norm": dw,
-        "stdp_dw_relative": dw_rel,
-        "loaded_pathways": loaded,
-        "wallclock_sec": time.time() - t0,
+    # task_dotTracing.main() indexes outP['fitnessScore'], so return a dict.
+    return {
+        "fitnessScore": float(fitness),
+        "train_fitness": float(train_fitness),
+        "out_path": OUT_FILE_PATH,
     }
 
-    if cfg["inheritance"] == "lamarckian" and "ac_mc" in cfg["plastic"]:
-        outP["gene_out_w_ac_mc"] = extractGeneFromWeights(
-            H["feat_ac_mc"].value, H["ac_mc_src"]).tolist()
 
-    if cfg["verbose"]:
-        print(f"[do_task] fitness={fitness:.4f}  dw_rel={dw_rel:.4%}  "
-              f"({outP['wallclock_sec']:.1f}s)", flush=True)
-        if dw_rel < 0.01:
-            print("[do_task] WARNING STDP moved the weights <1%. The hybrid is "
-                  "effectively plain EVOL. Raise `episodes` or `nu`.", flush=True)
+def plotWeightGraphs(weight_features, ep, out_path=None):
+    out_path = out_path or OUT_FILE_PATH
+    os.makedirs(out_path, exist_ok=True)
+    names = list(weight_features.keys())
+    fig, axes = plt.subplots(1, len(names), figsize=(6 * len(names), 5))
+    if len(names) == 1:
+        axes = [axes]
+    for ax, name in zip(axes, names):
+        data = weight_features[name].value.detach().cpu().numpy()
+        vabs = max(abs(data.min()), abs(data.max())) or 1.0
+        im = ax.imshow(data, cmap="RdBu_r", vmin=-vabs, vmax=vabs, aspect="auto")
+        ax.set_title(name)
+        ax.set_xlabel("target neuron")
+        ax.set_ylabel("source neuron")
+        div = make_axes_locatable(ax)
+        plt.colorbar(im, cax=div.append_axes("right", size="5%", pad=0.05))
+    fig.suptitle(f"Synaptic Weights — Episode {ep}")
+    fig.tight_layout()
+    fname = os.path.join(out_path, f"weights_ep{ep:05d}.png")
+    plt.savefig(fname, bbox_inches="tight")
+    plt.close(fig)
+    return fname
 
-    try:
-        env.close()
-    except Exception:
-        pass
-    return outP
+def plotMotorWeightPolar(w_ac_mc, active_mask, ep, out_path=None):
+    """
+    The paper's Figure 9: fraction of total AC->MC weight allocated to each motor
+    population, split by active vs inactive ACs at the current state.
+    """
+    out_path = out_path or OUT_FILE_PATH
+    os.makedirs(out_path, exist_ok=True)
+    W = w_ac_mc.detach().cpu().numpy()
+    pops = np.array_split(np.arange(W.shape[1]), moveChoices)
+    act = active_mask.detach().cpu().numpy().astype(bool)
+    fig, ax = plt.subplots(subplot_kw={"projection": "polar"}, figsize=(5, 5))
+    ang = np.linspace(0, 2 * np.pi, moveChoices, endpoint=False)
+    for label, sel, colour in (("active", act, "r"), ("inactive", ~act, "b")):
+        if sel.sum() == 0:
+            continue
+        tot = W[sel].sum()
+        vals = np.array([W[sel][:, p].sum() for p in pops]) / (tot or 1.0)
+        ax.plot(np.append(ang, ang[0]), np.append(vals, vals[0]), colour, label=label)
+    ax.set_xticks(ang)
+    ax.set_xticklabels([f"a{i}" for i in range(moveChoices)])
+    ax.legend(loc="upper right")
+    ax.set_title(f"AC→MC weight allocation — ep {ep}")
+    fname = os.path.join(out_path, f"motorpolar_ep{ep:05d}.png")
+    plt.savefig(fname, bbox_inches="tight")
+    plt.close(fig)
+    return fname
 
+def rasterSubsample(spk, max_n):
+    """(time, n) -> (time, <=max_n). Evenly spaced neuron subset, chosen so it does
+    not bias toward low indices. max_n <= 0 means keep every neuron."""
+    n = spk.shape[1]
+    if max_n <= 0 or n <= max_n:
+        return spk
+    idx = torch.linspace(0, n - 1, max_n, device=spk.device).long()
+    return spk[:, idx]
 
+def styleRasterAxes(axes, layers, gran, sizes, first_call=False):
+    """
+    Pin the raster axes every frame. plot_spikes() only calls set_offsets() when
+    reusing axes and never rescales, so matplotlib keeps whatever limits the FIRST
+    frame autoscaled to -- and since our opening frame is deliberately empty, that
+    is a degenerate range that squashes every later frame into a sliver. Setting
+    the limits explicitly also gives a real time axis, which plot_spikes strips.
+    """
+    for ax, layer in zip(axes, layers):
+        ax.set_xlim(0, gran)
+        ax.set_ylim(-1, sizes[layer])
+        ax.set_xticks(np.linspace(0, gran, 5))
+        ax.set_xlabel("")
+    axes[-1].set_xlabel(f"time within decision window (ms of {gran})")
+    if first_call:
+        axes[0].figure.subplots_adjust(top=0.86, bottom=0.13, hspace=0.6)
 
+def plotRasterTimeline(windows, layers, gran, ep, fname, max_points=400000):
+    """
+    Whole-episode spike raster: every decision window concatenated along x, with a
+    dashed line at each decision boundary. This is the "timeline" view -- the GIF
+    shows one window at a time, this shows the whole episode at once.
 
-# ignore below
-def _load_yaml_cfg(path):
-    import yaml
-    with open(path, "rt") as f:
-        y = yaml.safe_load(f)
-    return buildConfig({"main": y.get("main", {})}), y
-
-
-def _cli():
-    p = argparse.ArgumentParser(description="dot-tracing SNN utilities")
-    p.add_argument("--paramFile", type=str, default=None)
-    p.add_argument("--gene_lengths", action="store_true")
-    p.add_argument("--selftest", action="store_true")
-    p.add_argument("--calibrate", action="store_true")
-    p.add_argument("--episodes", type=int, default=None)
-    a = p.parse_args()
-
-    yaml_path = a.paramFile or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "task_dotTracing.yaml")
-    if os.path.exists(yaml_path):
-        cfg, raw = _load_yaml_cfg(yaml_path)
-    else:
-        cfg, raw = buildConfig({}), {}
-        print(f"[cli] no YAML at {yaml_path}, using DEFAULT_CFG", flush=True)
-
-    if a.gene_lengths:
-        L = geneLengths(cfg)
-        print("\nRequired YAML `param:` array sizes for this config")
-        print(f"  ac={cfg['ac']}  mc_pop={cfg['mc_pop']}  "
-              f"moveChoices={cfg['moveChoices']}  n_mc={cfg['n_mc']}")
-        print(f"  gc_ac_convergence={cfg['gc_ac_convergence']}  "
-              f"ac_mc_convergence={cfg['ac_mc_convergence']}\n")
-        for name, n in L.items():
-            marker = "  <-- in plastic:" if name in cfg["plastic"] else ""
-            print(f"  w_{name}:  array: [{n}]{marker}")
-        print()
-        declared = list((raw.get("param", {}) or {}).keys())
-        for name in cfg["plastic"]:
-            key = f"w_{name}"
-            if key not in declared:
-                print(f"  ERROR '{name}' is in plastic: but `param:` has no {key}")
-        for key in declared:
-            want = L.get(key[2:])
-            got = ((raw["param"][key] or {}).get("array") or [None])[0]
-            if want is not None and got is not None and int(got) != want:
-                print(f"  ERROR {key}: YAML says array:[{got}], config needs [{want}]")
-        return
-
-    if a.selftest:
-        if a.episodes:
-            cfg["episodes"] = a.episodes
-        L = geneLengths(cfg)
-        rng = np.random.default_rng(0)
-        mid = 0.5 * (cfg["w_min"] + cfg["w_max"])
-        sd = (cfg["w_max"] - cfg["w_min"]) / 6.0
-        fake = {"main": {"DotTracing": cfg}, "param": {}}
-        for name in cfg["plastic"]:
-            fake["param"][f"w_{name}"] = np.clip(
-                rng.normal(mid, sd, L[name]), cfg["w_min"], cfg["w_max"]).tolist()
-        print(f"[selftest] running {cfg['episodes']} episodes ...", flush=True)
-        out = do_task(fake, None)
-        print("\n[selftest] result")
-        for k, v in out.items():
-            if k != "gene_out_w_ac_mc":
-                print(f"  {k}: {v}")
-        print("\n[selftest] STDP contribution check")
-        print(f"  ||w_final - w_start|| / ||w_start|| = {out['stdp_dw_relative']:.4%}")
-        if out["stdp_dw_relative"] < 0.01:
-            print("  VERDICT: STDP is inert at this lifetime length. The hybrid "
-                  "reduces to plain EVOL. Raise `episodes` or `nu`.")
+    `windows` is a list (one per decision) of {layer: (gran, n) bool tensors}.
+    """
+    if not windows:
+        return None
+    fig, axes = plt.subplots(len(layers), 1, sharex=True,
+                             figsize=(max(8.0, 0.09 * len(windows) * 1.0), 2.2 * len(layers)))
+    if len(layers) == 1:
+        axes = [axes]
+    for ax, layer in zip(axes, layers):
+        full = torch.cat([w[layer] for w in windows], dim=0).cpu().numpy()
+        t, nidx = full.nonzero()
+        # Thin very dense rasters -- a scatter with millions of points is slow to
+        # draw and reads as a solid block anyway.
+        if t.size > max_points:
+            keep = np.linspace(0, t.size - 1, max_points).astype(int)
+            t, nidx = t[keep], nidx[keep]
+            ax.set_ylabel(f"{layer}\n(thinned)")
         else:
-            print("  VERDICT: STDP is moving the weights. Hybrid is live.")
-        return
+            ax.set_ylabel(layer)
+        ax.scatter(t, nidx, s=0.4, linewidths=0, color="k")
+        for b in range(gran, len(windows) * gran, gran):
+            ax.axvline(b, color="tab:red", lw=0.3, ls="--", alpha=0.5)
+        ax.set_xlim(0, len(windows) * gran)
+        ax.set_ylim(-1, full.shape[1])
+    axes[-1].set_xlabel(f"simulation time (ms) -- dashed = decision boundary "
+                        f"({gran} ms each, {len(windows)} decisions)")
+    fig.suptitle(f"Spike raster timeline -- episode {ep}")
+    fig.tight_layout()
+    fig.savefig(fname, bbox_inches="tight", dpi=110)
+    plt.close(fig)
+    return fname
 
-    if a.calibrate:
-        print("[calibrate] sweeping w_max for target MC rate "
-              f"{cfg['rate_target_mc']} Hz ...", flush=True)
-        L = geneLengths(cfg)
-        rng = np.random.default_rng(0)
-        for wmax in [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]:
-            c = copy.deepcopy(cfg)
-            c["w_max"], c["episodes"], c["frozen_episodes"] = wmax, 1, 0
-            c["stdp_enabled"], c["verbose"] = False, False
-            mid = 0.5 * (c["w_min"] + wmax)
-            sd = (wmax - c["w_min"]) / 6.0
-            fake = {"main": {"DotTracing": c}, "param": {
-                f"w_{n}": np.clip(rng.normal(mid, sd, L[n]), c["w_min"], wmax).tolist()
-                for n in c["plastic"]}}
-            try:
-                o = do_task(fake, None)
-                print(f"  w_max={wmax:5.2f} -> reward {o['mean_reward']:+8.2f}  "
-                      f"intercepts {o['mean_intercepts']:.2f}")
-            except Exception as e:
-                print(f"  w_max={wmax:5.2f} -> FAILED: {e}")
-        return
+def captureFrame(fig=None):
+    fig = fig or plt.gcf()
+    fig.canvas.draw()
+    w, h = fig.canvas.get_width_height()
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
+    return buf[:, :, :3].copy()
 
-    p.print_help()
+def saveReplayGIF(frames, fname, fps=20):
+    if not frames:
+        return None
+    imgs = [Image.fromarray(f) for f in frames]
+    imgs[0].save(fname, save_all=True, append_images=imgs[1:],
+                 duration=int(1000 / fps), loop=0)
+    return fname
+
+def genFileName(ftype, suffix=""):
+    t = time.time()
+    t = int(1e10 * (t - 1e6 * (t // 1e6)))
+    os.makedirs(OUT_FILE_PATH, exist_ok=True)
+    return os.path.join(OUT_FILE_PATH,
+                        ftype + "_s" + str(t) + "_" + suffix + ".csv")
+
+
+# --------------------------------------------------------------------------- #
+# Standalone entry point. Para-HADES normally supplies `param`; when this file is
+# run directly there is no GA, so synthesise a candidate from the `param:` block
+# of task_dotTracing.yaml (midpoint of each declared range).
+# --------------------------------------------------------------------------- #
+def standaloneParam(yaml_path=None):
+    import yaml
+    yaml_path = yaml_path or os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "task_dotTracing.yaml")
+    with open(yaml_path) as f:
+        spec = (yaml.safe_load(f) or {}).get("param", {}) or {}
+    genes = {}
+    for key, d in spec.items():
+        n = int((d.get("array") or [1])[0])
+        lo, hi = float(d.get("min", 0.0)), float(d.get("max", 1.0))
+        genes[key] = [0.5 * (lo + hi)] * n
+    return {"param": genes}
 
 
 if __name__ == "__main__":
-    _cli()
+    out = run_task(standaloneParam())
+    print("\n[standalone] result")
+    for k, v in out.items():
+        print(f"  {k}: {v}")

@@ -42,6 +42,10 @@ Changed the starting prime number in grid cell back to 3
 
 # TODO
 
+EVOL: add the scaling factors of each weights AND add the ac_mc connection
+
+MAYBE: include more improvements on the fitness scoring
+
 
 add more sparsity as time goes on - unsure
 

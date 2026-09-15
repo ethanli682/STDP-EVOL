@@ -79,3 +79,4 @@ data/
 checkpoints/
 results/
 *.mp4
+pc_*

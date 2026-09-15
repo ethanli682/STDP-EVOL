@@ -109,11 +109,21 @@ parser.add_argument("--diagnose", type=bool, default=True)
 parser.add_argument("--diag_stride", type=int, default=4)   # probe positions
 parser.add_argument("--diag_thresh", type=int, default=4)   # spikes -> "active"
 
+# PLACE-CELL LOCATION MAP (`--pc_map True` runs it and exits before training)
+parser.add_argument("--pc_map", type=bool, default=True)
+parser.add_argument("--pc_map_stride", type=int, default=1)   # 1 = every square
+parser.add_argument("--pc_map_reps", type=int, default=2)     # >=2 enables decode
+parser.add_argument("--pc_map_thresh", type=int, default=4)   # spikes -> "fired"
+parser.add_argument("--pc_map_top", type=int, default=10)     # idx shown per row
+parser.add_argument("--pc_map_fields", type=int, default=25)  # fields to plot
+parser.add_argument("--pc_map_layers", type=str, nargs="+",
+                    default=["PC_A", "PC_T"])
+
 args = parser.parse_args()
 
 moveChoices = 9 if args.diag else 5
 DEVICE = torch.device("cuda" if (torch.cuda.is_available() and args.gpu) else "cpu")
-OUT_FILE_PATH = "PR5_RUN_TEST2/"
+OUT_FILE_PATH = "PR5_RUN_TEST4/"
 
 LAYER_GCA, LAYER_GCT = "GC_A", "GC_T"      # grid code at agent / at target
 LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
@@ -510,7 +520,7 @@ def main():
     ac_mc_mask = Mask(name='ac_mc_mask',value=ac_mc_mask_gen)
  
     # apply some scaling number to the acmc weight
-    W_ac_mc = ac_mc_mask_gen * torch.rand(args.ac, n_mc, device=DEVICE) * 5
+    W_ac_mc = ac_mc_mask_gen * torch.rand(args.ac, n_mc, device=DEVICE) * 2
  
     feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc, range=[0,5],
                         learning_rule=MSTDPET, nu=[args.nu, args.nu])
@@ -554,6 +564,15 @@ def main():
         spikes[layer] = Monitor(net.layers[layer], state_vars=["s"],
                                 time=int(args.granularity / args.dt), device=DEVICE)
         net.add_monitor(spikes[layer], name=layer)
+
+    # Place-cell -> location map. GC->PC is frozen, so this measures the
+    # architecture and gives the same answer before and after training; it runs
+    # first and exits, because there is no point spending hours on a training job
+    # whose place layers cannot say where the dot is.
+    if args.pc_map:
+        placeCellMap(net, W_grid, peak, args.granularity, args.dt,
+                     args.gc_max_rate)
+        return
  
     # check spike counts
     if args.diagnose:
@@ -827,6 +846,513 @@ def reportEncodingQuality(q, title="Encoding quality"):
         print(f"  !! MC always picks the same action regardless of position -- "
               f"check the AC->MC mask is not concentrating on one subpopulation.",
               flush=True)
+
+# =====================================================================
+# PLACE-CELL LOCATION MAP  --  `--pc_map True`
+#
+# The question this answers: "can I tell where the dot is just by looking at
+# the place-cell spiking?" (NOTES.md TODO). It sweeps a single dot over every
+# square of the board, records which PC neurons clear the spike threshold, and
+# prints the square -> fired-neuron-indices table plus the numbers that say
+# whether that table is actually decodable.
+#
+# It differs from encodingQuality() in two ways that matter. encodingQuality
+# pins the agent at the centre and sweeps a coarse lattice of TARGET squares to
+# score AC/MC; this sweeps EVERY square at stride 1 and scores PC alone, and it
+# presents each square TWICE. The second presentation is the whole point: the
+# GC drive is Poisson, so a code that looks position-specific on one trial is
+# worthless if the active set changes completely on the next. Decoding trial 2
+# against trial 1 measures position information the way a downstream layer
+# would have to read it, instead of measuring a code against itself.
+# =====================================================================
+
+def pcMapSquares(dim, stride):
+    """Probed lattice, as (row list, col list, [(r, c), ...]) in row-major order."""
+    stride = max(1, int(stride))
+    rows = list(range(0, dim, stride))
+    cols = list(range(0, dim, stride))
+    return rows, cols, [(r, c) for r in rows for c in cols]
+
+def pcMapExtent(rows, cols):
+    """imshow extent covering one probe cell per lattice point (stride-sized)."""
+    sr = (rows[1] - rows[0]) / 2.0 if len(rows) > 1 else 0.5
+    sc = (cols[1] - cols[0]) / 2.0 if len(cols) > 1 else 0.5
+    return [cols[0] - sc, cols[-1] + sc, rows[-1] + sr, rows[0] - sr]
+
+@torch.no_grad()
+def sweepPlaceCells(net, W_grid, peak, gran, dt, max_rate, squares, reps, layers):
+    """
+    Drive the grid-cell streams with one board square at a time and return
+    {layer: (reps, n_squares, n_pc) spike counts}.
+
+    Both GC streams get the same square, which measures both place layers in one
+    sweep: PC_A and PC_T receive nothing except their own GC layer, so neither
+    can contaminate the other. They still give different codes for the same
+    square because their GC->PC masks are drawn from different seeds -- and that
+    comparison (same input, two random projections) is itself informative.
+
+    Only the two GC->PC connections are left in the network for the sweep. The
+    AC/MC layers still step, on zero input, but the AC 1000x1000 recurrence they
+    would otherwise drive is what dominates the runtime of a 784-square sweep.
+    Weights, layer parameters and layer objects are the live ones, so this is the
+    same pathway the training loop runs -- not a reimplementation of it.
+    """
+    dim = args.dim
+    peak_v = peak.squeeze(0)
+    zero_gc = torch.zeros(W_grid.shape[1], device=DEVICE)
+    R = {l: torch.zeros(reps, len(squares), net.layers[l].n) for l in layers}
+
+    keep = {k: v for k, v in net.connections.items()
+            if k in ((LAYER_GCA, LAYER_PCA), (LAYER_GCT, LAYER_PCT))}
+    saved_conns, was_learning = net.connections, net.learning
+    clock = time.time()
+    try:
+        net.connections, net.learning = keep, False
+        for rep in range(reps):
+            for i, (r, c) in enumerate(squares):
+                # Same row lookup the training loop uses: W_grid row k is the
+                # grid-cell code for board square k, normalised by each cell's
+                # peak and with the Gaussian tail cut off.
+                drive = (W_grid[r * dim + c] / peak_v).clamp(0.0, 1.0)
+                drive = torch.where(drive < 0.01, zero_gc, drive)
+                rates = drive * max_rate
+                net.reset_state_variables()
+                net.run(
+                    inputs={
+                        # independent Poisson draws per stream, as in training
+                        LAYER_GCA: poisson(rates.unsqueeze(0), gran, dt, device=DEVICE),
+                        LAYER_GCT: poisson(rates.unsqueeze(0), gran, dt, device=DEVICE),
+                    },
+                    time=gran, reward=0.0,
+                )
+                for l in layers:
+                    R[l][rep, i] = (net.monitors[l].get("s").squeeze()
+                                    .sum(0).float().cpu())
+                if (i + 1) % 200 == 0:
+                    print(f"  ...rep {rep + 1}/{reps}, square {i + 1}/{len(squares)} "
+                          f"({time.time() - clock:.1f}s)", flush=True)
+    finally:
+        net.connections, net.learning = saved_conns, was_learning
+        net.reset_state_variables()
+    return R
+
+def _decodeSquares(sim, squares, decodable):
+    """
+    Nearest-template decode: argmax similarity -> predicted square -> error in px.
+
+    `sim` is (n_test, n_template) with the diagonal meaning "test trial of square
+    i vs template of square i", so unlike the nearest-OTHER-code measure the
+    diagonal is a legitimate win here -- the trials are independent.
+    """
+    pred = sim.argmax(axis=1)
+    err = np.linalg.norm(squares[pred] - squares, axis=1)
+    err = np.where(decodable, err, np.nan)
+    return pred, err
+
+def analysePlaceCode(Rl, squares, thresh):
+    """
+    Turn (reps, P, n) spike counts into the per-square table and the summary
+    numbers. Rep 0 is the template/reference trial -- the one whose active sets
+    the printed table shows -- and reps 1.. are held-out trials.
+    """
+    reps, P, n = Rl.shape
+    R = Rl.numpy()
+    A = R >= thresh                                   # (reps, P, n) "fired"
+    ref, refA = R[0], A[0]
+    nact = refA.sum(1)
+
+    # Set stability across presentations: mean Jaccard over rep pairs. A code can
+    # be sparse, position-specific AND useless if this is near zero.
+    stab = np.full(P, np.nan, dtype=np.float32)
+    if reps >= 2:
+        acc, npair = np.zeros(P), 0
+        for i in range(reps):
+            for j in range(i + 1, reps):
+                inter = (A[i] & A[j]).sum(1).astype(np.float32)
+                union = (A[i] | A[j]).sum(1).astype(np.float32)
+                acc += np.where(union > 0, inter / np.maximum(union, 1), np.nan)
+                npair += 1
+        stab = (acc / max(npair, 1)).astype(np.float32)
+
+    # Nearest OTHER code, in pixels: if the most similar code belongs to a
+    # neighbouring square the code is spatially smooth; chance is the mean
+    # distance between two random squares.
+    norm = np.linalg.norm(ref, axis=1, keepdims=True)
+    Rn = ref / np.maximum(norm, 1e-9)
+    S = Rn @ Rn.T
+    np.fill_diagonal(S, -2.0)
+    live = norm.squeeze(1) > 0
+    D = np.linalg.norm(squares[:, None, :] - squares[None, :, :], axis=-1)
+    nn_px = D[np.arange(P), S.argmax(1)]
+    nn_px = np.where(live, nn_px, np.nan)
+    chance_px = D[~np.eye(P, dtype=bool)].mean()
+
+    # Identical active sets = two squares a set-reading decoder cannot ever tell
+    # apart. Silent squares are counted separately; they all "collide" trivially.
+    groups = {}
+    for i in range(P):
+        if nact[i] == 0:
+            continue
+        groups.setdefault(refA[i].tobytes(), []).append(i)
+    dup = [g for g in groups.values() if len(g) > 1]
+    n_dup_sq = sum(len(g) for g in dup)
+    worst_dup = max((D[np.ix_(g, g)].max() for g in dup), default=0.0)
+    n_firing_sq = int((nact > 0).sum())
+
+    # Decode held-out trials against the rep-0 templates, twice: once on rates
+    # (cosine) and once on the thresholded sets (Jaccard), because "fired neuron
+    # indices" is a set and a set decoder is the honest test of that table.
+    dec = {}
+    if reps >= 2:
+        Rt = R[1:].reshape(-1, n)
+        At = A[1:].reshape(-1, n)
+        sq_rep = np.tile(squares, (reps - 1, 1))
+        tmpl_n = np.linalg.norm(ref, axis=1)
+        test_n = np.linalg.norm(Rt, axis=1)
+        cos = (Rt / np.maximum(test_n[:, None], 1e-9)) @ Rn.T
+        inter = (At.astype(np.float32) @ refA.astype(np.float32).T)
+        union = At.sum(1)[:, None] + nact[None, :] - inter
+        jac = inter / np.maximum(union, 1e-9)
+        # Each decoder needs its own "was this trial decodable at all" mask.
+        # A trial with no cell above threshold gives the set decoder an all-zero
+        # similarity row, whose argmax is square 0 -- scoring that as a wrong
+        # guess measures the tie-break, not the code. The rate decoder reads raw
+        # counts, so it only fails when the window is completely empty.
+        oks = {"rate": test_n > 0,
+               "set": (At.sum(1) > 0) & (jac.max(axis=1) > 0)}
+        for name, sim in (("rate", cos), ("set", jac)):
+            _, err = _decodeSquares(sim, sq_rep, oks[name])
+            good = ~np.isnan(err)
+            dec[name] = dict(
+                n=int(good.sum()), undecodable=int((~good).sum()),
+                exact=float((err[good] == 0).mean()) if good.any() else float("nan"),
+                w1=float((err[good] <= 1.5).mean()) if good.any() else float("nan"),
+                w2=float((err[good] <= 2.9).mean()) if good.any() else float("nan"),
+                median=float(np.median(err[good])) if good.any() else float("nan"),
+                mean=float(err[good].mean()) if good.any() else float("nan"),
+            )
+        # per-square error (rate decoder, averaged over held-out trials) for the map
+        _, err_rate = _decodeSquares(cos, sq_rep, oks["rate"])
+        sq_err = np.nanmean(err_rate.reshape(reps - 1, P), axis=0)
+    else:
+        sq_err = np.full(P, np.nan)
+
+    # Place fields, from the rep-mean counts: a place cell should fire over one
+    # compact patch, so compare each cell's RMS spread about its own centroid
+    # with the spread of the probed lattice itself (1.0 = scattered / no field).
+    Rm = R.mean(0)
+    Am = Rm >= thresh
+    cell_pos = Am.sum(0)
+    centre = squares.mean(0)
+    lattice_rms = float(np.sqrt(((squares - centre) ** 2).sum(1).mean()))
+    fields = []
+    for j in range(n):
+        sel = Am[:, j]
+        if not sel.any():
+            fields.append((j, 0, np.nan, np.nan, np.nan, Rm[:, j].max()))
+            continue
+        pts, w = squares[sel], Rm[sel, j]
+        cen = (pts * w[:, None]).sum(0) / w.sum()
+        spread = float(np.sqrt((((pts - cen) ** 2).sum(1) * w).sum() / w.sum()))
+        fields.append((j, int(sel.sum()), cen[0], cen[1], spread, Rm[:, j].max()))
+    live_f = [f for f in fields if f[1] > 0]
+    field_sz = float(np.mean([f[1] for f in live_f])) if live_f else float("nan")
+    compact = (float(np.mean([f[4] for f in live_f])) / lattice_rms
+               if live_f else float("nan"))
+
+    return dict(
+        n=n, P=P, reps=reps, ref=ref, refA=refA, nact=nact, stab=stab,
+        nn_px=nn_px, chance_px=float(chance_px), sq_err=sq_err,
+        coverage=float((nact > 0).mean()), n_silent=int((nact == 0).sum()),
+        nact_mean=float(nact.mean()), nact_std=float(nact.std()),
+        rate_all=float(ref.mean()),
+        rate_active=float(ref[refA].mean()) if refA.any() else 0.0,
+        rate_max=float(ref.max()),
+        stab_mean=float(np.nanmean(stab)) if reps >= 2 else float("nan"),
+        n_unique=int(n_firing_sq - n_dup_sq), n_firing_sq=n_firing_sq,
+        n_dup=n_dup_sq, n_dup_groups=len(dup),
+        worst_dup_px=float(worst_dup), decode=dec, fields=fields,
+        cells_firing=int((cell_pos > 0).sum()), field_size=field_sz,
+        compactness=compact, lattice_rms=lattice_rms, Rmean=Rm,
+    )
+
+def printPlaceCellTable(st, squares, layer, thresh, top, out_path):
+    """
+    The table the diagnostic exists for: one row per board square, with the PC
+    neurons that fired for it. Console rows are truncated to `top` indices; the
+    CSV alongside carries every index and count.
+    """
+    os.makedirs(out_path, exist_ok=True)
+    csv = os.path.join(out_path, f"pc_map_{layer}.csv")
+    hdr = (f"  flat  (  r,  c)  nact   stab   err  "
+           f"fired place cells  (index:spikes, strongest first"
+           + (f", top {top} shown)" if top > 0 else ")"))
+    print(f"\n[{layer} place-cell map]  {st['P']} squares x {st['reps']} "
+          f"presentations, fired = >={thresh} spikes / {args.granularity} ms",
+          flush=True)
+    print(hdr, flush=True)
+    print("  " + "-" * (len(hdr) - 2), flush=True)
+
+    with open(csv, "w") as fh:
+        fh.write("flat,row,col,n_active,set_stability,decode_err_px,"
+                 "active_idx,active_spikes\n")
+        for i, (r, c) in enumerate(squares):
+            idx = np.nonzero(st["refA"][i])[0]
+            idx = idx[np.argsort(-st["ref"][i, idx])]
+            cnt = st["ref"][i, idx].astype(int)
+            stab = st["stab"][i]
+            err = st["sq_err"][i]
+            shown = idx if top <= 0 else idx[:top]
+            body = " ".join(f"{j}:{int(st['ref'][i, j])}" for j in shown)
+            if top > 0 and len(idx) > top:
+                body += f"  (+{len(idx) - top} more)"
+            print(f"  {r * args.dim + c:4d}  ({r:3d},{c:3d})  {len(idx):4d}  "
+                  f"{'  -  ' if np.isnan(stab) else f'{stab:5.2f}'}  "
+                  f"{'  -  ' if np.isnan(err) else f'{err:5.1f}'}  "
+                  f"{body if body else '(silent)'}", flush=True)
+            fh.write(f"{r * args.dim + c},{r},{c},{len(idx)},"
+                     f"{'' if np.isnan(stab) else f'{stab:.4f}'},"
+                     f"{'' if np.isnan(err) else f'{err:.3f}'},"
+                     f"\"{' '.join(map(str, idx))}\","
+                     f"\"{' '.join(map(str, cnt))}\"\n")
+    return csv
+
+def printPlaceCellSummary(st, layer, thresh):
+    """The summary that answers the question, and names the knob when it fails."""
+    print(f"\n  [{layer} summary]  {st['n']} place cells, "
+          f"{st['P']} squares, fired = >={thresh} spikes", flush=True)
+    print(f"    coverage      : {st['coverage']:6.1%} of squares have >=1 cell "
+          f"firing  ({st['n_silent']} silent)", flush=True)
+    print(f"    code size     : {st['nact_mean']:6.1f} +- {st['nact_std']:.1f} "
+          f"cells ({st['nact_mean'] / st['n']:.1%} of the layer)", flush=True)
+    print(f"    firing        : {st['rate_all']:6.2f} spikes/cell overall, "
+          f"{st['rate_active']:.1f} in cells that fired, peak "
+          f"{st['rate_max']:.0f}/{args.granularity}", flush=True)
+    if st["reps"] >= 2:
+        print(f"    set stability : {st['stab_mean']:6.2f} mean Jaccard between "
+              f"two presentations of the SAME square (1.0 = identical set)",
+              flush=True)
+    print(f"    unique sets   : {st['n_unique']:6d}/{st['n_firing_sq']} of the "
+          f"squares that fire have a set no other square shares "
+          f"({st['n_dup_groups']} colliding groups, worst pair "
+          f"{st['worst_dup_px']:.1f} px apart; the {st['n_silent']} silent "
+          f"squares are mutually indistinguishable and excluded)", flush=True)
+    print(f"    nearest code  : {np.nanmean(st['nn_px']):6.2f} px mean distance "
+          f"to the most similar OTHER square (chance {st['chance_px']:.2f} px)",
+          flush=True)
+    for name, label in (("rate", "rate decode (cosine)  "),
+                        ("set", "set  decode (Jaccard) ")):
+        d = st["decode"].get(name)
+        if d is None:
+            continue
+        note = (f"  [{d['undecodable']}/{d['n'] + d['undecodable']} trials had "
+                f"nothing to decode]" if d["undecodable"] else "")
+        if d["n"] == 0:
+            print(f"    {label}: no trial had anything to decode{note}",
+                  flush=True)
+            continue
+        print(f"    {label}: exact {d['exact']:5.1%} | <=1px {d['w1']:5.1%} | "
+              f"<=2px {d['w2']:5.1%} | median {d['median']:4.1f} px | mean "
+              f"{d['mean']:5.2f} px  (chance {st['chance_px']:.2f}){note}",
+              flush=True)
+    dr, ds = st["decode"].get("rate"), st["decode"].get("set")
+    if dr and dr["mean"] < 0.25 * st["chance_px"] and st["coverage"] < 0.9:
+        print(f"    note: position IS recoverable from the raw spike counts "
+              f"({dr['mean']:.1f} px vs {st['chance_px']:.1f} chance) even "
+              f"though only {st['coverage']:.0%} of squares put a cell above "
+              f"--pc_map_thresh={thresh}. The code is there, sitting "
+              f"sub-threshold; AC reads counts so it is not fatal, but nothing "
+              f"here reads as a place cell and the fired-set table is empty. "
+              f"Raise --gc_pc_gain, or lower --pc_map_thresh to see it.",
+              flush=True)
+
+    print(f"    place fields  : {st['cells_firing']}/{st['n']} cells fire "
+          f"somewhere; field {st['field_size']:.1f} squares, compactness "
+          f"{st['compactness']:.2f} (0 = point-like, 1.0 = scattered over the "
+          f"whole board)", flush=True)
+
+    # Verdicts, in the order a failure has to be fixed: alive -> sparse ->
+    # repeatable -> unambiguous. A later number is meaningless if an earlier
+    # one is broken.
+    d = st["decode"].get("rate")
+    if st["coverage"] < 0.9:
+        print(f"    !! {layer} is silent at {1 - st['coverage']:.0%} of squares: "
+              f"those locations cannot be represented at all. Raise "
+              f"--gc_pc_gain, or raise the PC threshold less aggressively "
+              f"(LIFNodes thresh is -25 mV now).", flush=True)
+    elif st["nact_mean"] / st["n"] > 0.30:
+        print(f"    !! {layer} fires with {st['nact_mean'] / st['n']:.0%} of the "
+              f"layer active per square -- that is a population rate code, not "
+              f"place cells, and neighbouring squares will share most of their "
+              f"set. Lower --gc_pc_gain or raise the PC thresh.", flush=True)
+    elif st["reps"] >= 2 and st["stab_mean"] < 0.4:
+        print(f"    !! {layer} sets are not repeatable (Jaccard "
+              f"{st['stab_mean']:.2f}): the same square gives a different set "
+              f"each presentation, so no downstream layer can read position "
+              f"from it. Push cells further above threshold (--gc_pc_gain) so "
+              f"membership is not decided by Poisson noise, or lengthen the "
+              f"decision window (--granularity).", flush=True)
+    elif d is not None and d["mean"] > 0.25 * st["chance_px"]:
+        print(f"    !! {layer} is alive and repeatable but not position-"
+              f"selective: a held-out trial decodes to {d['mean']:.1f} px away "
+              f"on average vs {st['chance_px']:.1f} px for chance. The code is "
+              f"not carrying much location. Check --gc_pc_sparsity (5% of "
+              f"{args.n_pc} cells per GC) and the GC scales.", flush=True)
+    elif st["compactness"] > 0.6:
+        print(f"    ?? {layer} decodes well but its fields are scattered "
+              f"(compactness {st['compactness']:.2f}): cells are random "
+              f"projections of the grid code rather than single-patch place "
+              f"cells. Decoding works, but a raster will not look like place "
+              f"cells to the eye.", flush=True)
+    else:
+        print(f"    OK: {layer} localises the dot to "
+              f"{d['mean'] if d else float('nan'):.1f} px "
+              f"(chance {st['chance_px']:.1f}), sets {st['stab_mean']:.2f} "
+              f"repeatable, {st['nact_mean']:.0f}/{st['n']} cells per square.",
+              flush=True)
+
+def plotPlaceCellMaps(st, rows, cols, layer, out_path=OUT_FILE_PATH):
+    """Four board-shaped maps: is the code alive, repeatable, and decodable, and
+    where on the board does it fail? A blind spot shows up here as a patch."""
+    os.makedirs(out_path, exist_ok=True)
+    shape = (len(rows), len(cols))
+    ext = pcMapExtent(rows, cols)
+    panels = [
+        ("cells firing per square", st["nact"].astype(float), "Blues", None),
+        ("set stability (Jaccard)", st["stab"].astype(float), "Blues", (0, 1)),
+        ("decode error (px)", st["sq_err"], "Reds", None),
+        ("distance to nearest other code (px)", st["nn_px"], "Reds", None),
+    ]
+    fig, axes = plt.subplots(1, 4, figsize=(19, 4.6))
+    for ax, (title, data, cmap, lim) in zip(axes, panels):
+        img = data.reshape(shape)
+        # Sequential ramps start at zero: an all-zero error map must read as the
+        # bottom of the ramp, and a flat count map must read as flat, rather
+        # than matplotlib inventing a range around a constant.
+        # ...and a floor of 1 px on the top of the ramp, so a perfect (all-zero)
+        # error map is white on a 0-1 px scale instead of matplotlib inventing a
+        # 1e-9 axis around the constant.
+        vmin, vmax = lim if lim else (0.0, max(float(np.nanmax(img)), 1.0))
+        im = ax.imshow(img, cmap=cmap, vmin=vmin, vmax=vmax, extent=ext,
+                       interpolation="nearest")
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("board col")
+        ax.set_ylabel("board row")
+        for s in ax.spines.values():
+            s.set_color("0.7")
+        ax.tick_params(colors="0.4", labelsize=8)
+        div = make_axes_locatable(ax)
+        plt.colorbar(im, cax=div.append_axes("right", size="4%", pad=0.05))
+    fig.suptitle(f"{layer}: place-cell code over the {args.dim}x{args.dim} board "
+                 f"(white = no data / silent)")
+    fig.tight_layout()
+    fname = os.path.join(out_path, f"pc_map_{layer}.png")
+    fig.savefig(fname, bbox_inches="tight", dpi=110)
+    plt.close(fig)
+    return fname
+
+def plotPlaceFields(st, rows, cols, layer, n_show, out_path=OUT_FILE_PATH):
+    """
+    Montage of individual place fields: each panel is one cell's spike count over
+    the board. Cells are sampled evenly across the activity range rather than
+    taking the loudest, so the montage shows what a typical cell looks like.
+    """
+    os.makedirs(out_path, exist_ok=True)
+    live = [f for f in st["fields"] if f[1] > 0]
+    if not live or n_show <= 0:
+        return None
+    live.sort(key=lambda f: f[1])                       # by field size
+    pick = [live[int(k)] for k in
+            np.linspace(0, len(live) - 1, min(n_show, len(live)))]
+    ncol = int(np.ceil(np.sqrt(len(pick))))
+    nrow = int(np.ceil(len(pick) / ncol))
+    shape = (len(rows), len(cols))
+    ext = pcMapExtent(rows, cols)
+    fig, axes = plt.subplots(nrow, ncol, figsize=(2.1 * ncol, 2.2 * nrow))
+    axes = np.atleast_1d(axes).ravel()
+    for ax, f in zip(axes, pick):
+        j, npos, cr, cc, spread, mx = f
+        im = ax.imshow(st["Rmean"][:, j].reshape(shape), cmap="Blues", vmin=0.0,
+                       extent=ext, interpolation="nearest")
+        ax.plot([cc], [cr], "+", color="0.2", ms=7, mew=1.2)
+        ax.set_title(f"cell {j}  {npos} sq\nspread {spread:.1f} px, "
+                     f"peak {mx:.0f}", fontsize=7)
+        ax.set_xticks([]); ax.set_yticks([])
+        for s in ax.spines.values():
+            s.set_color("0.8")
+        div = make_axes_locatable(ax)
+        plt.colorbar(im, cax=div.append_axes("right", size="5%", pad=0.04))
+    for ax in axes[len(pick):]:
+        ax.axis("off")
+    fig.suptitle(f"{layer} place fields (mean spikes / {args.granularity} ms, "
+                 f"+ = weighted centroid), sampled across field size")
+    fig.tight_layout()
+    fname = os.path.join(out_path, f"pc_fields_{layer}.png")
+    fig.savefig(fname, bbox_inches="tight", dpi=110)
+    plt.close(fig)
+    return fname
+
+def writePlaceFieldCSV(st, layer, out_path=OUT_FILE_PATH):
+    """The transpose of the main table: one row per place cell, its field."""
+    os.makedirs(out_path, exist_ok=True)
+    fname = os.path.join(out_path, f"pc_fields_{layer}.csv")
+    with open(fname, "w") as fh:
+        fh.write("neuron,n_squares_active,centroid_row,centroid_col,"
+                 "spread_px,peak_spikes\n")
+        for j, npos, cr, cc, spread, mx in st["fields"]:
+            fh.write(f"{j},{npos},"
+                     f"{'' if np.isnan(cr) else f'{cr:.3f}'},"
+                     f"{'' if np.isnan(cc) else f'{cc:.3f}'},"
+                     f"{'' if np.isnan(spread) else f'{spread:.3f}'},"
+                     f"{mx:.1f}\n")
+    return fname
+
+def placeCellMap(net, W_grid, peak, gran, dt, max_rate, out_path=OUT_FILE_PATH):
+    """Run the whole place-cell -> location diagnostic and report it."""
+    layers = [l for l in args.pc_map_layers if l in net.layers]
+    if not layers:
+        print(f"[pc_map] none of {args.pc_map_layers} are layers in this network "
+              f"({list(net.layers)})", flush=True)
+        return {}
+    reps = max(1, args.pc_map_reps)
+    rows, cols, squares = pcMapSquares(args.dim, args.pc_map_stride)
+    sq = np.array(squares, dtype=np.float32)
+
+    print(f"\n[pc_map] sweeping a dot over {len(squares)} squares "
+          f"(stride {max(1, args.pc_map_stride)}) x {reps} presentations, "
+          f"{gran} ms each, layers {layers}", flush=True)
+    if reps < 2:
+        print("[pc_map] --pc_map_reps 1: no held-out trial, so no decode or "
+              "stability numbers -- the table is still written.", flush=True)
+    t0 = time.time()
+    R = sweepPlaceCells(net, W_grid, peak, gran, dt, max_rate,
+                        squares, reps, layers)
+    print(f"[pc_map] sweep done in {time.time() - t0:.1f}s", flush=True)
+
+    stats = {}
+    for l in layers:
+        st = analysePlaceCode(R[l], sq, args.pc_map_thresh)
+        stats[l] = st
+        csv = printPlaceCellTable(st, squares, l, args.pc_map_thresh,
+                                  args.pc_map_top, out_path)
+        printPlaceCellSummary(st, l, args.pc_map_thresh)
+        fcsv = writePlaceFieldCSV(st, l, out_path)
+        p1 = plotPlaceCellMaps(st, rows, cols, l, out_path)
+        p2 = plotPlaceFields(st, rows, cols, l, args.pc_map_fields, out_path)
+        print(f"    wrote {csv}\n          {fcsv}\n          {p1}"
+              + (f"\n          {p2}" if p2 else ""), flush=True)
+
+    if len(stats) == 2:
+        a, b = list(stats)
+        print(f"\n[pc_map] {a} vs {b}: same dot, two independent GC->PC "
+              f"projections. mean decode error "
+              f"{stats[a]['decode'].get('rate', {}).get('mean', float('nan')):.2f}"
+              f" vs "
+              f"{stats[b]['decode'].get('rate', {}).get('mean', float('nan')):.2f}"
+              f" px -- a large gap means the projection seed, not the "
+              f"architecture, is deciding how well position is encoded.",
+              flush=True)
+    return stats
 
 def plotWeightGraphs(weight_features, ep, out_path=OUT_FILE_PATH):
     os.makedirs(out_path, exist_ok=True)

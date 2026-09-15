@@ -1,33 +1,25 @@
 import os
 
+# to be ran on tufts hpc cluster with only conda env
 # This function retuen a text with the slurm script
 def SlurmScript(jobName, 
                 jobTime = '00-23:55:55', 
                 jobMemory='32768', 
                 output_path='logs_', 
-                jobCPUs=1, jobGPUs=0,
+                jobCPUs=32, jobGPUs=0,
                 excludeNodes = [],
-                condaEnv = 'base',
+                condaEnv = 'Para-HADES',
                 partition = 'preempt',
                 command = 'echo "Hello World!"',
                 scriptName = 'script.sh',
-                singularity_image='/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif',
                 nextTask = '',
                 extra_pythonpath = '',
-                run_mode = 'singularity',
-                conda_sh = '/cluster/tufts/levinlab/hhazan01/miniconda3/etc/profile.d/conda.sh',
+                run_mode = 'conda',
+                conda_sh = 'source /cluster/home/eli08/miniconda3/etc/profile.d/conda.sh',
                 ):
 
-      # run_mode selects HOW the command is executed on the compute node:
-      #   'singularity' (default) -> OLD cluster path, run inside singularity_image.
-      #   'conda'                 -> NEW cluster path, run natively in conda env `condaEnv`.
-      # Default is 'singularity' so every existing caller/yaml behaves EXACTLY as before.
       run_mode = (str(run_mode).strip().lower() or 'singularity')
       use_conda = (run_mode == 'conda')
-
-      if singularity_image is None or str(singularity_image).strip() == '':
-            singularity_image = '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'
-      
       
       returnText = '#!/bin/bash\n'
       returnText += '#SBATCH --job-name=' + jobName + '\n'
@@ -99,10 +91,6 @@ def SlurmScript(jobName,
       # activate modules 
       # returnText += 'module load gcc/11.2.0 \n'
       # returnText += 'module unload gcc/7.3.0 \n'
-      # module load singularity only in the OLD-cluster singularity path; the NEW
-      # cluster has no singularity module (conda-native), so skip it there.
-      if not use_conda:
-            returnText += 'module load singularity \n'
 
       # for debugging and diagnostics logging 
       returnText += 'echo "-------------1---------------"\n'
@@ -160,41 +148,20 @@ def SlurmScript(jobName,
       # the shared default for every other task.
       pythonpath_val = project_root if not extra_pythonpath else f'{project_root}:{extra_pythonpath}'
 
-      if use_conda:
-            # NEW-cluster conda-native path. Activate the env and run the command
-            # directly (no container). SLURM_* vars are already in this shell's
-            # environment (no --env passthrough needed). PYTHONPATH + thread caps
-            # are set exactly as the singularity path set them, for parity.
-            returnText += 'echo "------Conda Exec-----"\n'
-            returnText += f'source {conda_sh}\n'
-            returnText += f'conda activate {condaEnv}\n'
-            returnText += f'export PYTHONPATH={pythonpath_val}\n'
-            returnText += 'export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}\n'
-            returnText += 'export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}\n'
-            returnText += 'export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}\n'
-            returnText += f'echo "Running command in conda env {condaEnv}: {command}"\n'
-            returnText += command + ' &\n'
-      else:
-            # OLD-cluster singularity path (unchanged).
-            returnText += 'echo "------Singularity Exec-----"\n'
-            # Build env args only for variables that are set to avoid empty --env entries.
-            returnText += 'SINGULARITY_ENV_ARGS=""\n'
-            returnText += 'for V in SLURM_JOB_ID SLURM_MEM_PER_NODE SLURM_MEM_PER_CPU SLURM_MEM SLURM_CPUS_PER_TASK SLURM_CPUS_ON_NODE SLURM_NTASKS SLURM_JOB_NUM_NODES; do\n'
-            returnText += '  if [ -n "${!V:-}" ]; then\n'
-            returnText += '    SINGULARITY_ENV_ARGS="$SINGULARITY_ENV_ARGS --env ${V}=${!V}"\n'
-            returnText += '  fi\n'
-            returnText += 'done\n'
+      # NEW-cluster conda-native path. Activate the env and run the command
+      # directly (no container). SLURM_* vars are already in this shell's
+      # environment (no --env passthrough needed). PYTHONPATH + thread caps
+      # are set exactly as the singularity path set them, for parity.
+      returnText += 'echo "------Conda Exec-----"\n'
+      returnText += f'source {conda_sh}\n'
+      returnText += f'conda activate {condaEnv}\n'
+      returnText += f'export PYTHONPATH={pythonpath_val}\n'
+      returnText += 'export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}\n'
+      returnText += 'export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}\n'
+      returnText += 'export MKL_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}\n'
+      returnText += f'echo "Running command in conda env {condaEnv}: {command}"\n'
+      returnText += command + ' &\n'
 
-            # Use --cleanenv to avoid host Python/CUDA library leakage into container.
-            singularity_cmd = f'singularity exec {nv_flag}--cleanenv --bind /cluster:/cluster ' \
-                             f'--env PYTHONPATH={pythonpath_val} ' \
-                             f'--env OMP_NUM_THREADS=${{SLURM_CPUS_PER_TASK:-1}} ' \
-                             f'--env OPENBLAS_NUM_THREADS=${{SLURM_CPUS_PER_TASK:-1}} ' \
-                             f'--env MKL_NUM_THREADS=${{SLURM_CPUS_PER_TASK:-1}} ' \
-                             f'$SINGULARITY_ENV_ARGS ' \
-                             f'{singularity_image} {command}'
-            returnText += f'echo "Running command in Singularity: {singularity_cmd}"\n'
-            returnText += singularity_cmd + ' &\n'
       returnText += 'PID="$!"\n'
       returnText += 'wait ${PID}\n'
       returnText += '\n'      

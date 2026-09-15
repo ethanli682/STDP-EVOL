@@ -43,6 +43,7 @@ def run_task(param, args):
         outP = {"fitnessScore": None, "error": str(exc)}
     
     #------------------------------------------------------------------------------------------
+
     
     print(f'---- End Task ----- {datetime.now().strftime("%d-%m-%Y-%H-%M-%S-%f")}', flush=True)
     print(f'---- Task Total Time ----- {(time.time() - start_time)} sec', flush=True)
