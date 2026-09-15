@@ -36,7 +36,7 @@ def run_task(param, args):
     #------------------------Task Start--------------------------------------
     #calls the file with simulation
     try:
-        outP = dot_tracingtask.do_task(param)
+        outP = dot_tracingtask.do_task(param, args)
     except Exception as exc:
         print(f"Task - candidate FAILED: {exc}", flush=True)
         traceback.print_exc()

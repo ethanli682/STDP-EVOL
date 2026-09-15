@@ -1019,8 +1019,8 @@ if __name__ == "__main__":
     
     # Example - Find the Siquence task
     parser.add_argument("--path", type=str, default='../Para-HADES_Tasks/test_directory')   #ES_FindSeq    # pass to the next process
-    parser.add_argument("--paramFile", type=str, default='task_FindSeq.yaml')      # pass to the next process
-    parser.add_argument("--taskFilename", type=str, default='task_FindSeq.py')      # pass to the next process
+    parser.add_argument("--paramFile", type=str, default='task_dotTracing.yaml')      # pass to the next process
+    parser.add_argument("--taskFilename", type=str, default='task_dotTracing.py')      # pass to the next process
     parser.add_argument("--evolutionTarget", type=int, default=1)      # 1 = Max, -1 = Min
 
     # DO NOT CHANGE-----Internal var-------------

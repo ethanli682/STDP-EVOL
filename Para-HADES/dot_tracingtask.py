@@ -130,6 +130,11 @@ LAYER_GCA, LAYER_GCT = "GC_A", "GC_T"      # grid code at agent / at target
 LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
 LAYER_AC, LAYER_MC = "AC", "MC"
 
+# Where every CSV / PNG / GIF this run produces is written. run_task() overrides it
+# per candidate when Para-HADES supplies a task namespace; this module-level default
+# is what a standalone run -- and any HADES call that does not pass one -- uses.
+OUT_FILE_PATH = "dotTracing_out" + os.sep
+
 
 OPPONENT_PAIRS = [(1, 3), (2, 4)]          # up<->down, right<->left
 
