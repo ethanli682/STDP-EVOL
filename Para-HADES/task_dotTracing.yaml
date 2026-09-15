@@ -1,6 +1,78 @@
-
 param:
-  # acmc pathway is evolved along with scalars for all weights
+  # ------------------------------------------------------------------ #
+  # EVERY synaptic weight matrix in the network is a gene, followed by a
+  # per-pathway scaler. Sizes below are for the dot_tracingtask.py parser
+  # DEFAULTS, which are the single source of truth for the architecture:
+  #
+  #   n_gc  = len(gc_scales) * 7 rotations * 16 phases = 5*7*16 = 560
+  #   n_pc  = 500        (per place layer, two layers)
+  #   ac    = 1000
+  #   moveChoices = 5    (9 when --diag True)
+  #   mc_pop = 100  ->  n_mc = moveChoices * mc_pop = 500
+  #
+  # Each weight gene is the DENSE matrix, flattened row-major (C order).
+  # dot_tracingtask.py reshapes it and then applies the fixed connectivity
+  # mask, so entries that fall outside the mask are inert -- that keeps the
+  # gene length a constant the YAML can state, instead of depending on which
+  # synapses a particular mask seed happened to open.
+  #
+  # If you change any of the architecture defaults in dot_tracingtask.py you
+  # MUST update the matching `array:` here; the task raises a ValueError that
+  # names the expected length rather than silently mis-shaping a matrix.
+  # ------------------------------------------------------------------ #
+
+  # ---- GRID CELL -> PLACE CELL (agent / target), 560 x 500 = 280000 ---- #
+  w_gc_pc_a:
+    type: float
+    array: [280000]
+    name: GC_to_PC_A
+    round: 4
+    min: 0.0
+    max: 1.0
+    coevo_group: gc_pc_a
+  w_gc_pc_t:
+    type: float
+    array: [280000]
+    name: GC_to_PC_T
+    round: 4
+    min: 0.0
+    max: 1.0
+    coevo_group: gc_pc_t
+
+  # ---- PLACE CELL -> ASSOCIATION (agent / target), 500 x 1000 = 500000 -- #
+  w_pc_ac_a:
+    type: float
+    array: [500000]
+    name: PC_A_to_AC
+    round: 4
+    min: 0.0
+    max: 1.0
+    coevo_group: pc_ac_a
+  w_pc_ac_t:
+    type: float
+    array: [500000]
+    name: PC_T_to_AC
+    round: 4
+    min: 0.0
+    max: 1.0
+    coevo_group: pc_ac_t
+
+  # ---- ASSOCIATION recurrent reservoir, 1000 x 1000 = 1000000 ---------- #
+  # Signed: the reservoir replaces a randn() draw, so it needs both halves.
+  # The diagonal is zeroed by the task, whatever the gene says.
+  w_rec:
+    type: float
+    array: [1000000]
+    name: AC_to_AC
+    round: 4
+    min: -1.0
+    max: 1.0
+    coevo_group: rec
+
+  # ---- ASSOCIATION -> MOTOR, the plastic pathway --------------------- #
+  # One value per (AC neuron, ACTION) = 1000 * 5 = 5000, broadcast across the
+  # mc_pop neurons of each action. A full per-synapse gene (1000 * 500 =
+  # 500000) is also accepted by the task if you widen `array:` to that.
   w_ac_mc:
     type: float
     array: [5000]
@@ -9,6 +81,21 @@ param:
     min: 0.0
     max: 1.0
     coevo_group: ac_mc
+
+  # ---- MOTOR opponent inhibition ------------------------------------- #
+  # One magnitude per directed opponent block: (up->down, down->up,
+  # right->left, left->right). Magnitudes are non-negative; the sign comes
+  # from scaler_inhib_mc, which the YAML pins to [-5, 0].
+  w_mc_opp:
+    type: float
+    array: [4]
+    name: MC_opponent
+    round: 4
+    min: 0.0
+    max: 1.0
+    coevo_group: mc_opp
+
+  # ---- per-pathway scalers (untagged -> the shared '_default' group) --- #
   scaler_gc_pc1: 
     type: float
     array: [1]

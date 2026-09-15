@@ -165,6 +165,19 @@ def geneArray(param, key, n):
         )
     return a
 
+
+def geneMatrix(param, key, rows, cols):
+    """A weight-matrix gene: the DENSE (rows, cols) matrix flattened row-major.
+
+    Every synaptic pathway in this network draws its weights from a gene of this
+    shape, so EVOL searches the whole connectome rather than a handful of gains.
+    The connectivity mask is applied by the caller AFTER the reshape, so the gene
+    length stays a constant the YAML can declare instead of depending on how many
+    synapses a particular mask seed happened to open.
+    """
+    a = geneArray(param, key, rows * cols)
+    return torch.from_numpy(a).to(DEVICE).view(rows, cols)
+
 # select action based on the largest spiking population
 def wtaAction(mc_spikes, n_actions, rng):
     """mc_spikes: (time, n_mc) -> action index. Aggregate count per subpopulation."""
@@ -520,17 +533,19 @@ def run_task(param, task_args=None):
 
     # grid cell to place cell connections
     # 5% sparsity
+    # The mask (which synapses exist) is fixed architecture drawn from args.seed;
+    # the weights themselves are the w_gc_pc_* genes.
     gen_a = torch.Generator(device="cpu").manual_seed(args.seed + 10)
     gc_pc_mask_a = (torch.rand(n_gc, args.n_pc, generator=gen_a)
                     < args.gc_pc_sparsity).float().to(DEVICE)
-    W_gc_pc_a = gc_pc_mask_a * torch.rand(n_gc, args.n_pc, device=DEVICE)
+    W_gc_pc_a = gc_pc_mask_a * geneMatrix(param, "w_gc_pc_a", n_gc, args.n_pc)
     W_gc_pc_a = (W_gc_pc_a / gc_pc_mask_a.sum(0).mean().clamp(min=1.0).sqrt()
                  ) * s_gc_pc1
 
     gen_t = torch.Generator(device="cpu").manual_seed(args.seed + 11)
     gc_pc_mask_t = (torch.rand(n_gc, args.n_pc, generator=gen_t)
                     < args.gc_pc_sparsity).float().to(DEVICE)
-    W_gc_pc_t = gc_pc_mask_t * torch.rand(n_gc, args.n_pc, device=DEVICE)
+    W_gc_pc_t = gc_pc_mask_t * geneMatrix(param, "w_gc_pc_t", n_gc, args.n_pc)
     W_gc_pc_t = (W_gc_pc_t / gc_pc_mask_t.sum(0).mean().clamp(min=1.0).sqrt()
                  ) * s_gc_pc2
 
@@ -551,11 +566,11 @@ def run_task(param, task_args=None):
     pc_ac_a_mask = (torch.rand(args.n_pc, args.ac, generator=gen_a) 
                     <= args.pc_ac_sparsity).float().to(DEVICE)
     # decrease agent place cell influence slightly
-    W_pc_ac_a = (pc_ac_a_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
+    W_pc_ac_a = (pc_ac_a_mask * geneMatrix(param, "w_pc_ac_a", args.n_pc, args.ac)
                  / np.sqrt(dense_fan)) * s_pc_ac1
     pc_ac_t_mask = (torch.rand(args.n_pc, args.ac, generator=gen_t) 
                         <= args.pc_ac_sparsity).float().to(DEVICE)
-    W_pc_ac_t = (pc_ac_t_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
+    W_pc_ac_t = (pc_ac_t_mask * geneMatrix(param, "w_pc_ac_t", args.n_pc, args.ac)
                  / np.sqrt(dense_fan)) * s_pc_ac2
 
     feat_pc_ac_a = Weight(name="w_pc_ac_a", value=W_pc_ac_a)
@@ -571,15 +586,17 @@ def run_task(param, task_args=None):
         source=LAYER_PCT, target=LAYER_AC)
 
     # Recurrent association layer connection reservoir, no learning done
-    rec_gen = torch.Generator(device="cpu").manual_seed(args.seed)
-    W_rec = torch.randn(args.ac, args.ac, generator=rec_gen)
+    # The reservoir is dense, so there is no mask: the gene IS the matrix. It is
+    # declared signed in the YAML (min -1 / max 1) because it replaces a randn()
+    # draw and the layer needs both excitatory and inhibitory recurrence.
+    W_rec = geneMatrix(param, "w_rec", args.ac, args.ac)
     # normalize each by sum of their columns and mult by scale factor
     # W_rec = W_rec / W_rec.abs().sum(0, keepdim=True).clamp(min=1e-6) 
     # YAML allows scaler_inhib_ac down to 0.0, and this is a DIVISOR, so clamp:
     # at 0 the recurrent weights blow up to inf and the whole episode goes NaN.
     W_rec = W_rec / max(s_inhib_ac, 1e-3)
     W_rec.fill_diagonal_(0.0)
-    feat_rec = Weight(name="w_rec", value=W_rec.to(DEVICE))
+    feat_rec = Weight(name="w_rec", value=W_rec)
     net.add_connection(
         MulticompartmentConnection(source=ac, target=ac,
                                    pipeline=[feat_rec], device=DEVICE),
@@ -631,12 +648,15 @@ def run_task(param, task_args=None):
     # scaler_inhib_mc is declared in the YAML as min -5.0 / max 0.0, i.e. the gene
     # is ALREADY negative. Negating it here (as the original line did) would make
     # opponent pairs excite each other, so use it as-is.
-    w_opp = s_inhib_mc
-    for a, b in OPPONENT_PAIRS: # two pairs - up down and right left
+    # w_mc_opp holds one MAGNITUDE per directed opponent block, in the order
+    # (a->b, b->a) for each entry of OPPONENT_PAIRS, so the two directions of a
+    # pair can evolve asymmetrically. s_inhib_mc supplies the (negative) sign.
+    g_opp = geneArray(param, "w_mc_opp", 2 * len(OPPONENT_PAIRS))
+    for i, (a, b) in enumerate(OPPONENT_PAIRS): # two pairs - up down and right left
         sa = slice(a * args.mc_pop, (a + 1) * args.mc_pop)
         sb = slice(b * args.mc_pop, (b + 1) * args.mc_pop)
-        W_mc_opp[sa, sb] = w_opp      # a inhibits b
-        W_mc_opp[sb, sa] = w_opp      # b inhibits a
+        W_mc_opp[sa, sb] = float(g_opp[2 * i]) * s_inhib_mc      # a inhibits b
+        W_mc_opp[sb, sa] = float(g_opp[2 * i + 1]) * s_inhib_mc  # b inhibits a
 
     feat_mc_opp = Weight(name="w_mc_opp", value=W_mc_opp)
     net.add_connection(
@@ -849,11 +869,23 @@ def standaloneParam(yaml_path=None):
     with open(yaml_path) as f:
         spec = (yaml.safe_load(f) or {}).get("param", {}) or {}
     genes = {}
+    rng = np.random.default_rng(args.seed)
     for key, d in spec.items():
         n = int((d.get("array") or [1])[0])
         lo, hi = float(d.get("min", 0.0)), float(d.get("max", 1.0))
-        genes[key] = [0.5 * (lo + hi)] * n
+        if n == 1:
+            # A scaler: the midpoint of its range is the neutral standalone value.
+            genes[key] = [0.5 * (lo + hi)]
+        else:
+            # A weight matrix: a constant midpoint would make every neuron in the
+            # layer see the identical input, so draw uniformly over the declared
+            # range instead -- the same distribution the pre-gene code used.
+            genes[key] = rng.uniform(lo, hi, size=n).astype(np.float32).tolist()
     return {"param": genes}
+
+
+# task_dotTracing.py (the Para-HADES worker) calls dot_tracingtask.do_task(param).
+do_task = run_task
 
 
 if __name__ == "__main__":
