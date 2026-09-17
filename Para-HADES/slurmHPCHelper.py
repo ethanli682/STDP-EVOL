@@ -15,11 +15,16 @@ def SlurmScript(jobName,
                 nextTask = '',
                 extra_pythonpath = '',
                 run_mode = 'conda',
-                conda_sh = 'source /cluster/home/eli08/miniconda3/etc/profile.d/conda.sh',
+                conda_sh = '/cluster/home/eli08/miniconda3/etc/profile.d/conda.sh',
+                singularity_image = None,
                 ):
 
-      run_mode = (str(run_mode).strip().lower() or 'singularity')
-      use_conda = (run_mode == 'conda')
+      # This cluster is conda-native: there is no singularity module and the old
+      # shared container (/cluster/tufts/levinlab/hhazan01/...) is not readable by
+      # this account. `run_mode`/`singularity_image` are still accepted because the
+      # task_*.py callers all pass them, but both are ignored -- everything runs in
+      # the conda env `condaEnv`.
+      run_mode = (str(run_mode).strip().lower() or 'conda')
       
       returnText = '#!/bin/bash\n'
       returnText += '#SBATCH --job-name=' + jobName + '\n'

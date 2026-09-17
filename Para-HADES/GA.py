@@ -240,7 +240,6 @@ def run(args, self=False, exc=False, params=None):
             excludeNodes= params['main']['Main_resource']['exclude_nodes'] if self else params['main']['Task_resource']['exclude_nodes'],
             condaEnv=params['main']['Main_resource']['conda_env'] if self else params['main']['Task_resource']['conda_env'],
             partition=params['main']['Main_resource']['partition'] if self else params['main']['Task_resource']['partition'],
-            singularity_image=params['main']['Main_resource'].get('singularity_image', '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif') if self else params['main']['Task_resource'].get('singularity_image', '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'),
             # run_mode gates singularity (default, OLD cluster) vs conda (NEW cluster).
             # Absent from the yaml -> 'singularity' -> unchanged behavior for every existing run.
             run_mode=params['main']['Main_resource'].get('run_mode', 'singularity') if self else params['main']['Task_resource'].get('run_mode', 'singularity'),

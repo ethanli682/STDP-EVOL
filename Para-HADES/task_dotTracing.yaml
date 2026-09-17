@@ -61,7 +61,7 @@ main:
     theadsPerCore: 2
     memory: '64GB'
     time: '00-23:59:59'
-    conda_env: 'delayW'
+    conda_env: 'Para-HADES'
     partition: 'preempt'
     exclude_nodes: ''
     path: '/logs_Task'
@@ -73,7 +73,7 @@ main:
     theadsPerCore: 2
     memory: '64GB'
     time: '00-23:59:59'
-    conda_env: 'delayW'
+    conda_env: 'Para-HADES'
     partition: 'preempt'
     exclude_nodes: ''
     path: '/logs_Agent'

@@ -130,6 +130,8 @@ LAYER_GCA, LAYER_GCT = "GC_A", "GC_T"      # grid code at agent / at target
 LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
 LAYER_AC, LAYER_MC = "AC", "MC"
 
+OUT_FILE_PATH = "dotTracing_out" + os.sep
+
 
 OPPONENT_PAIRS = [(1, 3), (2, 4)]          # up<->down, right<->left
 
@@ -391,7 +393,7 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
     return sum(past_performances)/len(past_performances)
 
 
-def run_task(param, task_args=None):
+def run_dot_task(param, task_args=None):
     """
     param      -- one Para-HADES candidate. param['param'] holds the decoded
                   genes: w_ac_mc plus the six/seven scalers.
@@ -498,7 +500,7 @@ def run_task(param, task_args=None):
                     rest=-64.0, reset=-70.0, thresh=-25.0,
                     refrac=1, tc_decay=20.0, tc_trace=20.0,
                     lbound=args.pc_lbound)
-
+    # tcdecay, refrac, tresh
     ac = LIFNodes(n=args.ac, traces=True,
                   rest=-64.0, reset=-70.0, thresh=-50.0,
                   refrac=1, tc_decay=20.0, tc_trace=20.0,

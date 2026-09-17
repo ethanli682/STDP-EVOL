@@ -36,7 +36,7 @@ def run_task(param, args):
     #------------------------Task Start--------------------------------------
     #calls the file with simulation
     try:
-        outP = dot_tracingtask.do_task(param)
+        outP = dot_tracingtask.run_dot_task(param)
     except Exception as exc:
         print(f"Task - candidate FAILED: {exc}", flush=True)
         traceback.print_exc()
@@ -196,7 +196,6 @@ def run(args, self=False, params=None):
             excludeNodes=params['main']['Task_resource']['exclude_nodes'] if self else params['main']['Main_resource']['exclude_nodes'],
             condaEnv=params['main']['Task_resource']['conda_env'] if self else params['main']['Main_resource']['conda_env'],
             partition=params['main']['Task_resource']['partition'] if self else params['main']['Main_resource']['partition'],
-                singularity_image=params['main']['Task_resource'].get('singularity_image', '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif') if self else params['main']['Main_resource'].get('singularity_image', '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'),
             command="python " + str(run_process).replace('[','').replace(']','').replace('\', \'',' ').replace('\'',''),
             nextTask=temp_file,
         )
