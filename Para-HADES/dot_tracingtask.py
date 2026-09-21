@@ -102,6 +102,30 @@ parser.add_argument("--mc_lbound", type=float, default=-80.0)
 parser.add_argument("--w_max", type=float, default=1.0)
 parser.add_argument("--nu", type=float, default=4e-3)
 
+# --------------------------------------------------------------------------- #
+# Synaptic calibration gains. The 1/sqrt(fan_in) normalisation used below is a
+# RATE-code convention: it assumes every presynaptic unit delivers ~1.0 of drive
+# per timestep. Spikes are sparse binary events, so the real drive per timestep is
+# smaller by roughly the presynaptic firing probability (~0.016/ms for GC), which
+# left PC tens of times short of threshold: with these gains at 1.0 the PC
+# membrane peaks near -53 mV against a -25 mV threshold for EVERY gene in the
+# YAML range, so PC/AC/MC never spiked, wtaAction always fell through to its
+# random branch, and the GA was scoring pure noise.
+#
+# Values below were measured by sweeping one stage at a time with the scaler
+# genes at their midpoint (2.5), targeting sparse-but-alive rates:
+#   gain_gc_pc = 20.0  ->  PC ~15 Hz
+#   gain_pc_ac = 10.0  ->  AC ~19 Hz
+#   gain_ac_mc =  0.2  ->  MC ~43 Hz   (AC->MC has no fan-in normalisation at
+#                                       all, hence the sub-1 gain)
+# Across the [0, 5] scaler range each stage now spans silent -> saturated, so
+# the genes actually have an effect. Re-measure if the layer sizes, sparsities
+# or thresholds change.
+# --------------------------------------------------------------------------- #
+parser.add_argument("--gain_gc_pc", type=float, default=20.0)
+parser.add_argument("--gain_pc_ac", type=float, default=10.0)
+parser.add_argument("--gain_ac_mc", type=float, default=0.2)
+
 parser.add_argument("--diagnose", type=str2bool, default=True)
 parser.add_argument("--diag_stride", type=int, default=4)   # probe positions
 parser.add_argument("--diag_thresh", type=int, default=4)   # spikes -> "active"
@@ -131,6 +155,46 @@ LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
 LAYER_AC, LAYER_MC = "AC", "MC"
 
 OUT_FILE_PATH = "dotTracing_out" + os.sep
+
+# Fallback evaluation counter. One task process evaluates several candidates
+# (task_dotTracing.main loops genes x repeats), and every one of them used to
+# write the same filenames into the same folder, so only the LAST candidate's
+# rasters/GIFs/weight plots survived. When the caller does not tell us which
+# candidate this is, this monotonic counter keeps them apart instead.
+_EVAL_SEQ = itertools.count()
+
+
+def _outDirFor(task_args):
+    """Per-candidate output directory.
+
+    Layout: <path>/dotTracing_out/agent<idx>/epoch<counter>_gene<g>_test<t>/
+
+    Separates the three axes that actually vary: agents run as independent
+    processes and must never touch each other's files; epochs are successive
+    generations; genes/repeats are the candidates within one dispatch. Re-running
+    the same epoch reuses the same names, which is the one overwrite we want.
+    """
+    if task_args is None or not getattr(task_args, "path", None):
+        return OUT_FILE_PATH
+
+    def clean(v, default):
+        v = default if v is None else v
+        # agent_counter arrives as the string "<counter>.<epoch>"; keep it
+        # readable but never let a separator escape into the path.
+        return str(v).replace(os.sep, "-").replace("/", "-").strip() or str(default)
+
+    agent = clean(getattr(task_args, "agent_idx", None), 0)
+    epoch = clean(getattr(task_args, "agent_counter", None), 0)
+    gene = getattr(task_args, "gene_num", None)
+    test = getattr(task_args, "test_rep", None)
+    if gene is None and test is None:
+        # Caller did not identify the candidate -- fall back to a running index
+        # so candidates still land in distinct folders.
+        leaf = f"epoch{epoch}_eval{next(_EVAL_SEQ)}"
+    else:
+        leaf = f"epoch{epoch}_gene{clean(gene, 0)}_test{clean(test, 0)}"
+    return os.path.join(task_args.path, "dotTracing_out",
+                        f"agent{agent}", leaf) + os.sep
 
 
 OPPONENT_PAIRS = [(1, 3), (2, 4)]          # up<->down, right<->left
@@ -225,6 +289,7 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
         last_active_ac = torch.zeros(net.layers[LAYER_AC].n, device=DEVICE)
         clock = time.time()
         ac_frac_sum, mc_frac_sum = 0.0, 0.0
+        rate_sum = {l: 0.0 for l in (LAYER_PCA, LAYER_PCT, LAYER_AC, LAYER_MC)}
 
         avg_reward = 0
 
@@ -289,6 +354,14 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
             ac_frac_sum += last_active_ac.mean().item()
             mc_frac_sum += (mc.sum(0) > 0).float().mean().item()
 
+            # Mean firing rate per layer, in Hz. A stage that reads 0.00 here has
+            # broken the sensor -> motor chain: everything downstream is silent
+            # and wtaAction below is returning uniform noise, so the episode's
+            # fitness says nothing about the genes. Reported once per episode.
+            for l in rate_sum:
+                rate_sum[l] += (spikes[l].get("s").float().mean().item()
+                                * 1000.0 / dt)
+
             # get the action from the most active motor cell population
             action = wtaAction(mc, env.action_space.n, rng)
 
@@ -350,11 +423,23 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
             net.reward_fn.update(accumulated_reward=total_reward, steps=step)
 
         # plotting + diagnostics code
-        print(f"Episode {ep}: total reward {total_reward:.2f}"
+        rates = {l: v / max(1, step) for l, v in rate_sum.items()}
+        print(f"Episode {ep}: total reward {total_reward:.2f} "
               f"intercepts {intercepts} "
               f"target visible {visible_steps / max(1, step):.0%} | "
               f"AC active {ac_frac_sum / max(1, step):.1%}, "
-              f"MC active {mc_frac_sum / max(1, step):.1%} | ")
+              f"MC active {mc_frac_sum / max(1, step):.1%} | rates "
+              + " ".join(f"{l} {r:.1f}Hz" for l, r in rates.items()))
+        # PC_T is DRIVEN ONLY WHEN THE TARGET IS IN VIEW, so a silent PC_T in an
+        # episode where the target was never visible is the gate working, not a
+        # broken layer. Every other layer should spike in every episode.
+        dead = [l for l, r in rates.items()
+                if r <= 0.0 and not (l == LAYER_PCT and visible_steps == 0)]
+        if dead:
+            print(f"  [DEAD] no spikes in {', '.join(dead)} for the whole "
+                  f"episode -- actions were uniform random, so this candidate's "
+                  f"fitness carries no signal about its genes. Check the "
+                  f"--gain_* calibration and the layer thresholds.", flush=True)
         os.makedirs(OUT_FILE_PATH, exist_ok=True)
         if capturing and replay_frames:
             saveReplayGIF(replay_frames,
@@ -396,21 +481,17 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
 def run_dot_task(param, task_args=None):
     """
     param      -- one Para-HADES candidate. param['param'] holds the decoded
-                  genes: w_ac_mc plus the six/seven scalers.
-    task_args  -- the Para-HADES slurm namespace (path, agent_idx, ...). It is
-                  NOT the config namespace; deliberately not named `args` so it
-                  cannot shadow the module-level parser defaults, which are what
-                  every architecture knob is read from.
+                  genes: w_ac_mc plus the seven scalers.
+    task_args  -- arguments including path and agent_idx. 
     Returns {'fitnessScore': float, ...}.
     """
     global OUT_FILE_PATH
 
-    # Per-candidate output folder: parallel agents must not share one.
-    if task_args is not None and getattr(task_args, "path", None):
-        OUT_FILE_PATH = os.path.join(
-            task_args.path, "dotTracing_out",
-            f"agent{getattr(task_args, 'agent_idx', 0)}"
-            f"_test{getattr(task_args, 'agent_test_num', 0)}") + os.sep
+    # Per-candidate output folder. agent_test_num used to be the only thing
+    # separating runs, but GA.py never assigns it (it stays at its -1 default),
+    # so every candidate of every epoch landed in one "agent<i>_test-1" folder
+    # and clobbered the previous one's plots.
+    OUT_FILE_PATH = _outDirFor(task_args)
     os.makedirs(OUT_FILE_PATH, exist_ok=True)
 
     # Seed here, not at import: the module is imported once but run_task is called
@@ -527,14 +608,14 @@ def run_dot_task(param, task_args=None):
                     < args.gc_pc_sparsity).float().to(DEVICE)
     W_gc_pc_a = gc_pc_mask_a * torch.rand(n_gc, args.n_pc, device=DEVICE)
     W_gc_pc_a = (W_gc_pc_a / gc_pc_mask_a.sum(0).mean().clamp(min=1.0).sqrt()
-                 ) * s_gc_pc1
+                 ) * s_gc_pc1 * args.gain_gc_pc
 
     gen_t = torch.Generator(device="cpu").manual_seed(args.seed + 11)
     gc_pc_mask_t = (torch.rand(n_gc, args.n_pc, generator=gen_t)
                     < args.gc_pc_sparsity).float().to(DEVICE)
     W_gc_pc_t = gc_pc_mask_t * torch.rand(n_gc, args.n_pc, device=DEVICE)
     W_gc_pc_t = (W_gc_pc_t / gc_pc_mask_t.sum(0).mean().clamp(min=1.0).sqrt()
-                 ) * s_gc_pc2
+                 ) * s_gc_pc2 * args.gain_gc_pc
 
     feat_gc_pc_a = Weight(name="w_gc_pc_a", value=W_gc_pc_a)
     net.add_connection(
@@ -554,11 +635,11 @@ def run_dot_task(param, task_args=None):
                     <= args.pc_ac_sparsity).float().to(DEVICE)
     # decrease agent place cell influence slightly
     W_pc_ac_a = (pc_ac_a_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
-                 / np.sqrt(dense_fan)) * s_pc_ac1
+                 / np.sqrt(dense_fan)) * s_pc_ac1 * args.gain_pc_ac
     pc_ac_t_mask = (torch.rand(args.n_pc, args.ac, generator=gen_t) 
                         <= args.pc_ac_sparsity).float().to(DEVICE)
     W_pc_ac_t = (pc_ac_t_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
-                 / np.sqrt(dense_fan)) * s_pc_ac2
+                 / np.sqrt(dense_fan)) * s_pc_ac2 * args.gain_pc_ac
 
     feat_pc_ac_a = Weight(name="w_pc_ac_a", value=W_pc_ac_a)
     net.add_connection(
@@ -618,7 +699,7 @@ def run_dot_task(param, task_args=None):
             f"array: [{n_gene_dense}] (per synapse). Fix task_dotTracing.yaml."
         )
     # apply the evolved scaling number to the acmc weight
-    W_ac_mc = ac_mc_mask_gen * W_ac_mc * s_ac_mc
+    W_ac_mc = ac_mc_mask_gen * W_ac_mc * s_ac_mc * args.gain_ac_mc
  
     feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc, range=[0,5],
                         learning_rule=MSTDPET, nu=[args.nu, args.nu])
@@ -859,7 +940,7 @@ def standaloneParam(yaml_path=None):
 
 
 if __name__ == "__main__":
-    out = run_task(standaloneParam())
+    out = run_dot_task(standaloneParam())
     print("\n[standalone] result")
     for k, v in out.items():
         print(f"  {k}: {v}")

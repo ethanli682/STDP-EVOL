@@ -1,0 +1,24 @@
+-------------1---------------
+Job is running on node(s): pax030 
+Job is running on host: pax030 
+Job ID is: 3771251
+Job name is: T_test_directory
+-------------2---------------
+nvidia-smi not found (CPU node)
+-------------3---------------
+-------------4---------------
+Job started!
+Wed Sep 16 07:15:17 PM EDT 2026
+-----------------------------
+------SLURM Env Debug-----
+SLURM_MEM_PER_CPU=
+SLURM_MEM=
+SLURM_MEM_PER_NODE=65536
+SLURM_CPUS_PER_TASK=24
+SLURM_CPUS_ON_NODE=24
+SLURM_NTASKS=1
+-----------------------------
+------Singularity Exec-----
+Running command in Singularity: singularity exec --cleanenv --bind /cluster:/cluster --env PYTHONPATH=/cluster/home/eli08/bindsnet/Para-HADES --env OMP_NUM_THREADS=24 --env OPENBLAS_NUM_THREADS=24 --env MKL_NUM_THREADS=24  --env SLURM_JOB_ID=3771251 --env SLURM_MEM_PER_NODE=65536 --env SLURM_CPUS_PER_TASK=24 --env SLURM_CPUS_ON_NODE=24 --env SLURM_NTASKS=1 --env SLURM_JOB_NUM_NODES=1 /cluster/tufts/levinlab/hhazan01/singularity/delayW.sif python3 task_dotTracing.py --callBackScript /cluster/home/eli08/bindsnet/Para-HADES/GA.py --path ../Para-HADES_Tasks/test_directory --agent_idx 3 --agent_counter 0.0 --agent_test_num -1 --total_test_with_same_param 1 --total_testsGene_with_same_agent 5 --gpu False --slurm True --parallel False --evolutionTarget 1 --paramFile task_dotTracing.yaml
+FATAL:   While checking image: could not open image /cluster/tufts/levinlab/hhazan01/singularity/delayW.sif: failed to retrieve path for /cluster/tufts/levinlab/hhazan01/singularity/delayW.sif: lstat /cluster/tufts/levinlab/hhazan01: permission denied
+Python script failed with exit status: 255

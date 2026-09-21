@@ -36,7 +36,7 @@ def run_task(param, args):
     #------------------------Task Start--------------------------------------
     #calls the file with simulation
     try:
-        outP = dot_tracingtask.run_dot_task(param)
+        outP = dot_tracingtask.run_dot_task(param, args)
     except Exception as exc:
         print(f"Task - candidate FAILED: {exc}", flush=True)
         traceback.print_exc()
@@ -73,6 +73,12 @@ def main(args):
     for gene_num in range(len(params_config)):
         fitness = []
         for test in range(args.total_test_with_same_param):
+            # Tell the task which candidate this is. Without it every gene and
+            # repeat in this process writes the same plot filenames into the same
+            # folder, so only the last one survives -- see _outDirFor() in
+            # dot_tracingtask.py.
+            args.gene_num = gene_num
+            args.test_rep = test
             #-----------------------
             outP = run_task(params_config[gene_num], args)
             #-----------------------
