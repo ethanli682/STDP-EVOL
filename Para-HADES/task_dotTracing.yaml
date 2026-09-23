@@ -57,9 +57,9 @@ main:
   Task_resource:
     type: CPU
     gpu: 0
-    cpu: 24
+    cpu: 32
     theadsPerCore: 2
-    memory: '64GB'
+    memory: '16GB'
     time: '00-23:59:59'
     conda_env: 'Para-HADES'
     partition: 'preempt'
@@ -69,9 +69,9 @@ main:
   Main_resource:
     type: CPU
     gpu: 0
-    cpu: 24
+    cpu: 32
     theadsPerCore: 2
-    memory: '64GB'
+    memory: '16GB'
     time: '00-23:59:59'
     conda_env: 'Para-HADES'
     partition: 'preempt'
