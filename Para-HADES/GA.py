@@ -43,7 +43,7 @@ def load(file_name):
 def _atomic_write_json(path, obj):
     tmp_path = path + f".tmp.{os.getpid()}.{int(time.time()*1e6)}"
     with open(tmp_path, 'wt') as f:
-        json.dump(obj, f)
+        json.dump(obj, f, default=fast_converter)
         f.flush()
         os.fsync(f.fileno())
     os.replace(tmp_path, path)
@@ -57,6 +57,57 @@ def _atomic_write_zstd_pickle(path, obj):
         raw_f.flush()
         os.fsync(raw_f.fileno())
     os.replace(tmp_path, path)
+
+
+def _write_new_member(path_prefix, payload):
+    """Write the candidate payload for one agent as JSON, always.
+
+    newMember files are the hand-off from the orchestrator to the task and are
+    short-lived (the task deletes its own after loading), so the compact pickle
+    form bought little and made the genes unreadable without a loader script.
+    `ea.geneFormat` still governs the *history* (.log.framed.bin), which stays
+    pickled. Every task_*.py reader already tries .json before falling back to
+    .pkl, so nothing task-side needs to change.
+    """
+    _atomic_write_json(path_prefix + '.newMember.json', payload)
+    # A run started before this change (or resumed from an older checkpoint) can
+    # leave a stale .newMember.pkl next to the new .json. The readers prefer the
+    # .json, but drop the pickle so the two can never disagree.
+
+
+
+def _claim_run_directory(args):
+    """Bind a run directory to one task, and refuse to let a different one in.
+
+    --path/--taskFilename/--paramFile used to default to
+    ../Para-HADES_Tasks/test_directory + task_FindSeq, so a GA.py launched
+    without them quietly started a FindSeq run inside whatever directory another
+    experiment was already using. Because every generated .sh re-sbatches itself
+    (nextTask=temp_file), that stray chain then kept resurfacing for days. The
+    defaults are gone now; this is the second line of defense for a directory
+    that gets reused by hand.
+    """
+    identity = {
+        'taskFilename': os.path.basename(str(args.taskFilename)),
+        'paramFile': os.path.basename(str(args.paramFile)),
+    }
+    marker = args.path + '/task.json'
+    if os.path.exists(marker):
+        try:
+            with open(marker, 'rt') as f:
+                existing = json.load(f)
+        except Exception:
+            existing = None
+        if existing and existing != identity:
+            raise SystemExit(
+                "GA - ABORT: run directory '" + args.path + "' belongs to "
+                + str(existing.get('taskFilename')) + " / " + str(existing.get('paramFile'))
+                + ", but this invocation is " + identity['taskFilename'] + " / "
+                + identity['paramFile'] + ". Use a different --path, or delete "
+                + marker + " if the reuse is deliberate."
+            )
+        return
+    _atomic_write_json(marker, identity)
 
 
 def _load_post_fitness_hook(params_config, paramFile):
@@ -388,6 +439,7 @@ def main(args):
             print("GA - Part 1 - Start", flush=True)
             # make automatic backup of the directory code in the running directory
             os.makedirs(args.path, exist_ok=True)
+            _claim_run_directory(args)
             os.makedirs(args.path + "/founders", exist_ok=True)
             os.makedirs(args.path + "/graphs", exist_ok=True)
 
@@ -575,10 +627,7 @@ def main(args):
                     f"GA - Part 1 - Agent - {args.agent_idx} - Candidate payload entries={len(param)} est_pickle_bytes={est_bytes}",
                     flush=True,
                 )
-                if ea.geneFormat == 'json':
-                    _atomic_write_json(args.path + "/running/" + str(args.agent_idx) + '.newMember.json', param)
-                elif ea.geneFormat == 'pickle':
-                    _atomic_write_zstd_pickle(args.path + "/running/" + str(args.agent_idx) + '.newMember.pkl', param)
+                _write_new_member(args.path + "/running/" + str(args.agent_idx), param)
 
                 run(args=copy.copy(args), self=False, exc=True, params=temp_copy_params_config)
                 if args.parallel:
@@ -592,6 +641,7 @@ def main(args):
                 return
 
         if args.part == 2: # individual run # summrize individual run
+            _claim_run_directory(args)
             agents = [args.agent_idx] if (args.parallel or args.slurm) else np.random.choice(args.num_of_agents, args.num_of_agents, replace=False)
             has_any_valid_fitness = False
 
@@ -962,10 +1012,7 @@ def main(args):
                     f"GA - Part 2 - Agent - {args.agent_idx} - Candidate payload entries={len(newParam)} est_pickle_bytes={est_bytes}",
                     flush=True,
                 )
-                if ea.geneFormat == 'json':
-                    _atomic_write_json(args.path + "/running/" + str(args.agent_idx) + '.newMember.json', newParam)
-                elif ea.geneFormat == 'pickle':
-                    _atomic_write_zstd_pickle(args.path + "/running/" + str(args.agent_idx) + '.newMember.pkl', newParam)
+                _write_new_member(args.path + "/running/" + str(args.agent_idx), newParam)
                 
                 print("GA - Part 2 - Agent - " + str(args.agent_idx) + " - Spwanning agents -  Pass 3", flush=True)
 
@@ -1016,10 +1063,12 @@ if __name__ == "__main__":
 
     parser.add_argument("--evolutionType", type=str, default='CondVAE') # GA, CMA_ES, SNES, etc. Comma-separated for multiple (e.g. GA,CMA_ES,SNES) - randomly picks one per agent
     
-    # Example - Find the Siquence task
-    parser.add_argument("--path", type=str, default='../Para-HADES_Tasks/test_directory')   #ES_FindSeq    # pass to the next process
-    parser.add_argument("--paramFile", type=str, default='task_FindSeq.yaml')      # pass to the next process
-    parser.add_argument("--taskFilename", type=str, default='task_FindSeq.py')      # pass to the next process
+    # Required. These used to default to ../Para-HADES_Tasks/test_directory +
+    # task_FindSeq, which meant a GA.py started without them ran the WRONG TASK
+    # into a directory another experiment already owned, silently.
+    parser.add_argument("--path", type=str, default=None)          # pass to the next process
+    parser.add_argument("--paramFile", type=str, default=None)     # pass to the next process
+    parser.add_argument("--taskFilename", type=str, default=None)  # pass to the next process
     parser.add_argument("--evolutionTarget", type=int, default=1)      # 1 = Max, -1 = Min
 
     # DO NOT CHANGE-----Internal var-------------
@@ -1039,6 +1088,16 @@ if __name__ == "__main__":
     if (args.num_of_agents * args.total_testsGene_with_same_agent) > args.populationSize:
        args.populationSize = args.num_of_agents * args.total_testsGene_with_same_agent
 
+    if args.path is None:
+        parser.error("--path is required (e.g. --path ../Para-HADES_Tasks/dotTracing_run1). "
+                     "It no longer defaults to a shared test directory.")
+    if args.taskFilename is None and args.paramFile is None:
+        parser.error("--taskFilename is required (e.g. --taskFilename task_dotTracing.py). "
+                     "It no longer defaults to task_FindSeq.py.")
+    if args.taskFilename is None:
+        _root, _ = os.path.splitext(args.paramFile.replace('"', ''))
+        args.taskFilename = _root + '.py'
+
     if args.taskFilename is not None:
         args.taskFilename = args.taskFilename.replace('"', '')
 
@@ -1056,6 +1115,9 @@ if __name__ == "__main__":
 
     if args.slurm: 
         args.parallel = False
+
+    print(f"GA - Task: {args.taskFilename} | Params: {args.paramFile} | Path: {args.path}",
+          flush=True)
 
     # OVERloading agent_counter
     tmp = args.agent_counter.split('.')
