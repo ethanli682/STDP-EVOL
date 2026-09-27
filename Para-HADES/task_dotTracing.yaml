@@ -51,13 +51,65 @@ param:
     name: inhib_mc
     min: -5.0
     max: 0.0
-  
+  scaler_gc_pc1S: 
+    type: float
+    array: [1]
+    name: gcpc1S
+    min: 0.0
+    max: 1.0
+  scaler_gc_pc2S: 
+    type: float
+    array: [1]
+    name: gcpc2S
+    min: 0.0
+    max: 1.0
+  scaler_pc_ac1S: 
+    type: float
+    array: [1]
+    name: pcac1S
+    min: 0.0
+    max: 1.0
+  scaler_pc_ac2S: 
+    type: float
+    array: [1]
+    name: pcac2S
+    min: 0.0
+    max: 1.0
+  scaler_ac_mcS: 
+    type: float
+    array: [1]
+    name: acmcS
+    min: 0.0
+    max: 1.0
+
+# Two-phase schedule, read by GA.py and handed to dot_task.py via
+# <path>/motor_phase.json (the live phase is stored there, so a resumed run keeps
+# its phase).
+#   sparsity: motor_params are pinned to one fixed random value in every
+#             candidate, so the GA only moves the GC/PC/AC genes. Fitness is how
+#             close the AC active fraction is to ac_target.
+#   motor:    entered the first time any candidate lands inside ac_target. Every
+#             gene is evolved, fitness is the task reward, and each candidate's
+#             weights are saved to weights.pt in its dotTracing_out folder.
+phases:
+  motor_params: [w_ac_mc, scaler_ac_mc, scaler_ac_mcS, scaler_inhib_mc]
+  ac_target: [0.25, 0.65]     # fraction of AC neurons active per step
+  sparsity:
+    trn_eps: 1
+    tst_eps: 0
+  motor:
+    trn_eps: 25
+    tst_eps: 10
+    save_weights: True
+    # fitness -= penalty * distance outside ac_target, so the AC layer can't
+    # drift back to silent once the motor genes start moving
+    ac_penalty: 10.0
 
 main:
   Task_resource:
     type: CPU
     gpu: 0
-    cpu: 32
+    cpu: 64
     theadsPerCore: 2
     memory: '16GB'
     time: '00-23:59:59'

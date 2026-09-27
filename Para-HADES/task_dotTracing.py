@@ -6,7 +6,7 @@ from GA_utils_misc_func import pickle_loads_compat
 import numpy as np
 
 # main dot tracing task in this file
-import dot_tracingtask
+import dot_task
 
 # Import the unified plotting system
 from GA_utils_plotting import UnifiedPlotter
@@ -36,7 +36,7 @@ def run_task(param, args):
     #------------------------Task Start--------------------------------------
     #calls the file with simulation
     try:
-        outP = dot_tracingtask.run_dot_task(param, args)
+        outP = dot_task.run_dot_task(param, args)
     except Exception as exc:
         print(f"Task - candidate FAILED: {exc}", flush=True)
         traceback.print_exc()

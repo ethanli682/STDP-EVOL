@@ -147,6 +147,116 @@ def _load_post_fitness_hook(params_config, paramFile):
         return None
 
 
+PHASE_FILE = 'motor_phase.json'
+
+
+def _load_phase(args):
+    """Current two-phase schedule state (see `phases:` in the task yaml), or None."""
+    try:
+        with open(args.path + '/' + PHASE_FILE, 'rt') as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _init_phase(args, params_config, ea):
+    """Create <path>/motor_phase.json on a run's first Part 1; keep it on resume.
+
+    The motor genes are pinned to one random draw for the whole sparsity phase,
+    so every candidate shares the same AC->MC wiring and the GA can only move the
+    upstream layers. The draw is stored here so every agent and every
+    generation pins to the same value.
+    """
+    spec = params_config.get('phases') if isinstance(params_config, dict) else None
+    if not spec:
+        return None
+    state = _load_phase(args)
+    if state is not None:
+        return state
+
+    by_name = {s['name']: s for s in ea.param_slices}
+    missing = [n for n in spec.get('motor_params', []) if n not in by_name]
+    if missing:
+        raise SystemExit("GA - ABORT: phases.motor_params names unknown params: " + str(missing))
+    gene = ea.generateRandomGene()
+    state = {
+        'phase': 'sparsity',
+        'config': spec,
+        'frozen_motor_gene': {
+            n: np.asarray(gene[by_name[n]['start']:by_name[n]['end']], dtype=float).tolist()
+            for n in spec.get('motor_params', [])
+        },
+    }
+    _atomic_write_json(args.path + '/' + PHASE_FILE, state)
+    print("GA - Phase - Starting in 'sparsity' phase; motor genes pinned: "
+          + str(list(state['frozen_motor_gene'])), flush=True)
+    return state
+
+
+def _pin_motor_genes(ea, gene_candidates, phase_state):
+    """During the sparsity phase, overwrite the motor slices of every candidate."""
+    if not phase_state or phase_state.get('phase') != 'sparsity':
+        return gene_candidates
+    by_name = {s['name']: s for s in ea.param_slices}
+    for g in gene_candidates:
+        for n, vals in phase_state['frozen_motor_gene'].items():
+            g[by_name[n]['start']:by_name[n]['end']] = vals
+    return gene_candidates
+
+
+def _maybe_enter_motor_phase(args, phase_state, ac_fracs):
+    """Flip to the motor phase once any sparsity-phase candidate hits ac_target."""
+    if not phase_state or phase_state.get('phase') != 'sparsity':
+        return phase_state
+    lo, hi = phase_state['config'].get('ac_target', [0.25, 0.65])
+    hits = [f for f in ac_fracs if f is not None and lo <= f <= hi]
+    if not hits:
+        if ac_fracs:
+            print(f"GA - Phase - Agent - {args.agent_idx} - sparsity phase, AC active "
+                  f"fractions {[round(f, 3) for f in ac_fracs if f is not None]} "
+                  f"(target {lo}-{hi})", flush=True)
+        return phase_state
+    # Another agent may have switched already; re-read so we don't clobber it.
+    latest = _load_phase(args) or phase_state
+    if latest.get('phase') == 'sparsity':
+        latest['phase'] = 'motor'
+        latest['switched_at'] = {
+            'agent_idx': int(args.agent_idx), 'epoch': int(args.epoch),
+            'iteration': int(args.agent_counter), 'ac_active_frac': float(hits[0]),
+            'time': datetime.now().isoformat(),
+        }
+        _atomic_write_json(args.path + '/' + PHASE_FILE, latest)
+        print(f"GA - Phase - Agent - {args.agent_idx} - AC active fraction {hits[0]:.3f} "
+              f"is inside {lo}-{hi}: switching to 'motor' phase", flush=True)
+    return latest
+
+
+def _sync_agent_phase(args, phase_state):
+    """Drop this agent's optimizer state the first time it runs in a new phase.
+
+    While the motor genes are pinned, every elite has identical values in those
+    dimensions, so CMA-ES/SNES/OpenAI-ES shrink their step size there towards
+    zero. Left alone, the motor genes would barely move after the switch. A fresh
+    state restarts with the full initial sigma; its mean re-forms from the elite
+    history on the first update.
+    """
+    if not phase_state:
+        return
+    os.makedirs(args.path + '/running', exist_ok=True)
+    marker = args.path + '/running/' + str(args.agent_idx) + '.phase'
+    try:
+        with open(marker, 'rt') as f:
+            previous = f.read().strip()
+    except Exception:
+        previous = None
+    if previous is not None and previous != phase_state['phase']:
+        for p in glob.glob(args.path + '/running/' + str(args.agent_idx) + '_*_metadata_.pkl'):
+            os.remove(p)
+            print(f"GA - Phase - Agent - {args.agent_idx} - reset optimizer state {p}", flush=True)
+    with open(marker, 'wt') as f:
+        f.write(phase_state['phase'])
+
+
 def _build_task_candidate_skeleton(params_config, agent_idx, epoch, iteration):
     candidate = {
         'fitnessScore': None,
@@ -494,6 +604,8 @@ def main(args):
                 _raw_fn = getattr(_mod, _fp_spec['function'])
                 ea.full_params_fn = lambda rec, _fn=_raw_fn, _cfg=params_config: _fn(rec, _cfg)
 
+            phase_state = _init_phase(args, params_config, ea)
+
             print("GA - Part 1 - Save Objec", flush=True)
 
             save(obj=[
@@ -584,6 +696,7 @@ def main(args):
                 param = []
                 temp_copy_params_config = params_config.copy()
 
+                _sync_agent_phase(args, phase_state)
                 if use_evolution:
                     build_in_params_default = ea.bulidin_params()
                     gene_candidates = _dispatch_evolution_algorithm(
@@ -592,6 +705,7 @@ def main(args):
                         number_of_candidate_genes=total_tasks_per_agent,
                         genePopulation=reusable_gene_population,
                     )
+                    _pin_motor_genes(ea, gene_candidates, phase_state)
                     for idx in range(total_tasks_per_agent):
                         gene = gene_candidates[idx]
                         param.append(_build_task_candidate_skeleton(temp_copy_params_config, args.agent_idx, args.epoch, args.agent_counter))
@@ -603,6 +717,7 @@ def main(args):
                 else:
                     for idx in range(total_tasks_per_agent):
                         gene = ea.generateRandomGene()
+                        _pin_motor_genes(ea, [gene], phase_state)
                         param.append(_build_task_candidate_skeleton(temp_copy_params_config, args.agent_idx, args.epoch, args.agent_counter))
                         temp_param_list = dict()
                         temp_param_list, param[-1]['param'] = ea.geneTOparam(gene.copy(), param_list=temp_param_list)
@@ -711,6 +826,7 @@ def main(args):
                 skipped_malformed_records = 0
                 skipped_invalid_fitness_records = 0
                 valid_fitness_records = 0
+                reported_ac_fracs = []
 
                 # Optional task-supplied fitness post-processor (see
                 # _load_post_fitness_hook). Loaded once per Part 2.
@@ -780,6 +896,8 @@ def main(args):
                             continue
 
                         valid_fitness_records += 1
+                        if reportParam.get('phase') == 'sparsity':
+                            reported_ac_fracs.append(reportParam.get('ac_active_frac'))
 
                         if 'loss' in reportParam and reportParam['loss'] is not None:
                             reportParam['loss'] = float(str(np.mean(reportParam['loss'])))
@@ -860,6 +978,9 @@ def main(args):
                         flush=True,
                     )
                                         
+                phase_state = _maybe_enter_motor_phase(args, _load_phase(args), reported_ac_fracs)
+                _sync_agent_phase(args, phase_state)
+
                 print("GA - Part 2 - Agent - " + str(args.agent_idx) + " - Pass 0", flush=True)
 
                 genePopulationHistory = ea.saveFounder(args)
@@ -976,6 +1097,7 @@ def main(args):
                         build_in_params=returned_build_in_params[0],
                         number_of_candidate_genes=args.total_testsGene_with_same_agent,
                     )
+                _pin_motor_genes(ea, gene_candidates, phase_state)
 
 
                 newParam = []
@@ -1061,7 +1183,7 @@ if __name__ == "__main__":
     parser.add_argument("--slurm", type=str, default='False')      # pass to the next process
     parser.add_argument("--parallel", type=str, default='False')      # pass to the next process
 
-    parser.add_argument("--evolutionType", type=str, default='CondVAE') # GA, CMA_ES, SNES, etc. Comma-separated for multiple (e.g. GA,CMA_ES,SNES) - randomly picks one per agent
+    parser.add_argument("--evolutionType", type=str, default='CMA_ES') # GA, CMA_ES, SNES, etc. Comma-separated for multiple (e.g. GA,CMA_ES,SNES) - randomly picks one per agent
     
     # Required. These used to default to ../Para-HADES_Tasks/test_directory +
     # task_FindSeq, which meant a GA.py started without them ran the WRONG TASK

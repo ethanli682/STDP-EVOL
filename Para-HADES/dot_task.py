@@ -1,4 +1,8 @@
-# the goal of this is to improve upon the rewarding mechanism
+# note: this will only be evolution
+
+
+# start at 1 eps, then increase
+
 
 import argparse
 import itertools
@@ -35,8 +39,8 @@ parser.add_argument("--dim", type=int, default=28)
 parser.add_argument("--granularity", type=int, default=100)
 parser.add_argument("--dt", type=float, default=1.0)
 #todo test gpu vs cpu without hades
-parser.add_argument("--trn_eps", type=int, default=25)
-parser.add_argument("--tst_eps", type=int, default=10)
+parser.add_argument("--trn_eps", type=int, default=1)
+parser.add_argument("--tst_eps", type=int, default=0)
 parser.add_argument("--decay", type=int, default=4)
 parser.add_argument("--herrs", type=int, default=0)
 parser.add_argument("--diag", type=str2bool, default=False)
@@ -51,8 +55,11 @@ parser.add_argument("--fcycle", type=int, default=100)
 parser.add_argument("--gpu", type=str2bool, default=True)
 parser.add_argument("--view_r", type=int, default=14)
 parser.add_argument("--make_sparse", type=str2bool, default=False)
-
-
+# weights.pt written by a motor-phase candidate: rebuild that network (its genes
+# and every connection's weights, including the learned AC->MC) instead of
+# drawing a fresh one
+parser.add_argument("--load_weights", type=str, default=None)
+parser.add_argument("--save_weights", type=str2bool, default=False)
 
 # GC layer 
 parser.add_argument("--gc_scales", type=int, nargs="+", default=[3, 5, 7, 11, 13])
@@ -64,26 +71,18 @@ parser.add_argument("--gc_max_rate", type=float, default=80.0)     # 8 spikes / 
 
 # PLACE CELL layers: one for the agent, one for the target
 parser.add_argument("--n_pc", type=int, default=500)          # per place layer
-parser.add_argument("--gc_pc_sparsity", type=float, default=0.05) 
 parser.add_argument("--pc_lbound", type=float, default=-80.0)
 
 # ASSOCIATION layer 
 parser.add_argument("--ac", type=int, default=1000) 
-parser.add_argument("--gc_ac_sparsity", type=float, default=0.12)
-parser.add_argument("--pc_ac_sparsity", type=float, default=0.1)
 parser.add_argument("--ac_lbound", type=float, default=-80.0) 
 
 # MOTOR layer 100 neurons per move (5 moves)
 parser.add_argument("--mc_pop", type=int, default=100)
-parser.add_argument("--ac_mc_sparsity", type=float, default=0.20)
 parser.add_argument("--ac_mc_init", type=float, default=0.3)
 parser.add_argument("--mc_lbound", type=float, default=-80.0)
 parser.add_argument("--w_max", type=float, default=1.0)
 parser.add_argument("--nu", type=float, default=4e-3)
-
-parser.add_argument("--gain_gc_pc", type=float, default=10.0)
-parser.add_argument("--gain_pc_ac", type=float, default=5.0)
-parser.add_argument("--gain_ac_mc", type=float, default=0.2)
 
 parser.add_argument("--diagnose", type=str2bool, default=True)
 parser.add_argument("--diag_stride", type=int, default=4)   # probe positions
@@ -113,7 +112,7 @@ LAYER_GCA, LAYER_GCT = "GC_A", "GC_T"      # grid code at agent / at target
 LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
 LAYER_AC, LAYER_MC = "AC", "MC"
 
-OUT_FILE_PATH = "dotTracing_out11" + os.sep
+OUT_FILE_PATH = "dotTracing_out3" + os.sep
 
 # Fallback evaluation counter. One task process evaluates several candidates
 # (task_dotTracing.main loops genes x repeats), and every one of them used to
@@ -157,6 +156,34 @@ def _outDirFor(task_args):
 
 
 OPPONENT_PAIRS = [(1, 3), (2, 4)]          # up<->down, right<->left
+
+# Sparsity-phase fitness sits this far below anything the reward can produce
+# (per-step reward is bounded by ~sqrt(2) + 10 on intercept), so once the motor
+# phase starts every motor-phase record outranks the sparsity-phase history the
+# optimizers still read.
+SPARSITY_FITNESS_FLOOR = -100.0
+PHASE_FILE = "motor_phase.json"
+
+
+def readPhase(task_args):
+    """Phase state written by GA.py (see `phases:` in task_dotTracing.yaml).
+
+    None when run standalone or when the yaml has no `phases:` block; the task
+    then falls back to the CLI episode counts and plain reward fitness.
+    """
+    path = getattr(task_args, "path", None) if task_args is not None else None
+    if not path:
+        return None
+    try:
+        import json
+        with open(os.path.join(path, PHASE_FILE)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def distanceOutside(x, lo, hi):
+    return max(lo - x, 0.0, x - hi)
 
 
 # --------------------------------------------------------------------------- #
@@ -210,6 +237,7 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
     rng = np.random.default_rng(args.seed)
 
     past_performances = []
+    ep_ac_fracs = []
 
     for ep in range(episodes):
         total_reward, intercepts, step = 0.0, 0, 0
@@ -320,6 +348,8 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
         if net.reward_fn is not None:
             net.reward_fn.update(accumulated_reward=total_reward, steps=step)
 
+        ep_ac_fracs.append(ac_frac_sum / max(1, step))
+
         # plotting + diagnostics code
         rates = {l: v / max(1, step) for l, v in rate_sum.items()}
         print(f"Episode {ep}: total reward {total_reward:.2f} "
@@ -349,17 +379,49 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
         if ep % args.fcycle == 0:
             env.cycleOutFiles()
 
-    # use the average performance of final 25 as the fitness score
+    # use the average performance of final 25 as the fitness score, and the
+    # mean fraction of AC neurons active per step over all episodes
+    ac_frac = float(np.mean(ep_ac_fracs)) if ep_ac_fracs else 0.0
     if not past_performances:
-        return 0.0
-    return sum(past_performances)/len(past_performances)
+        return 0.0, ac_frac
+    return sum(past_performances)/len(past_performances), ac_frac
 
 
-def run_dot_task(param, task_args=None):
+def saveWeights(path, features, param, extra):
+    """Everything needed to rebuild this exact network in a fresh process.
+
+    `genes` rebuilds the architecture and the seeded masks; `weights` then
+    overwrites every connection with the values this candidate ended with,
+    so w_ac_mc includes what MSTDPET learned over the training episodes.
     """
-    param      -- one Para-HADES candidate. param['param'] holds the decoded
-                  genes: w_ac_mc plus the seven scalers.
-    task_args  -- arguments including path and agent_idx. 
+    torch.save({
+        "weights": {k: f.value.detach().to_dense().cpu().clone()
+                    for k, f in features.items()},
+        "genes": param["param"],
+        **extra,
+    }, path)
+    print(f"[weights] saved {len(features)} tensors to {path}", flush=True)
+
+
+def loadWeights(path, features):
+    saved = torch.load(path, map_location="cpu")["weights"]
+    for k, f in features.items():
+        if k not in saved:
+            raise KeyError(f"{path} has no weights for '{k}'")
+        if tuple(saved[k].shape) != tuple(f.value.shape):
+            raise ValueError(f"'{k}' in {path} is {tuple(saved[k].shape)}, "
+                             f"this network needs {tuple(f.value.shape)}")
+        f.value.data.copy_(saved[k].to(f.value.device, f.value.dtype))
+    print(f"[weights] loaded {len(features)} tensors from {path}", flush=True)
+
+
+def run_dot_task(param, task_args=None, weights_path=None):
+    """
+    param        -- one Para-HADES candidate. param['param'] holds the decoded
+                    genes: w_ac_mc plus the scalers.
+    task_args    -- arguments including path and agent_idx.
+    weights_path -- optional weights.pt from saveWeights(); overwrites the
+                    gene-built connection weights before training.
     Returns {'fitnessScore': float, ...}.
     """
     global OUT_FILE_PATH
@@ -376,6 +438,18 @@ def run_dot_task(param, task_args=None):
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    # ---- phase schedule ---------------------------------------------------- #
+    phase_state = readPhase(task_args)
+    run_phase = phase_state["phase"] if phase_state else None
+    phase_cfg = (phase_state["config"].get(run_phase, {}) if phase_state else {})
+    ac_lo, ac_hi = (phase_state["config"].get("ac_target", [0.25, 0.65])
+                    if phase_state else (0.25, 0.65))
+    trn_eps = int(phase_cfg.get("trn_eps", args.trn_eps))
+    tst_eps = int(phase_cfg.get("tst_eps", args.tst_eps))
+    save_weights = bool(phase_cfg.get("save_weights", args.save_weights))
+    print(f"[phase] {run_phase or 'none'}: trn_eps={trn_eps} tst_eps={tst_eps} "
+          f"save_weights={save_weights}", flush=True)
+
     # ---- decode the scalar genes ------------------------------------------ #
     s_gc_pc1   = geneScalar(param, "scaler_gc_pc1")
     s_gc_pc2   = geneScalar(param, "scaler_gc_pc2")
@@ -384,6 +458,13 @@ def run_dot_task(param, task_args=None):
     s_ac_mc    = geneScalar(param, "scaler_ac_mc")
     s_inhib_ac = geneScalar(param, "scaler_inhib_ac")
     s_inhib_mc = geneScalar(param, "scaler_inhib_mc")
+
+    s_gc_pc1S   = geneScalar(param, "scaler_gc_pc1S")
+    s_gc_pc2S   = geneScalar(param, "scaler_gc_pc2S")
+    s_pc_ac1S   = geneScalar(param, "scaler_pc_ac1S")
+    s_pc_ac2S   = geneScalar(param, "scaler_pc_ac2S")
+    s_ac_mcS   = geneScalar(param, "scaler_ac_mcS")
+
     print(f"[gene] gc_pc={s_gc_pc1:.3f}/{s_gc_pc2:.3f}  "
           f"pc_ac={s_pc_ac1:.3f}/{s_pc_ac2:.3f}  ac_mc={s_ac_mc:.3f}  "
           f"inhib_ac={s_inhib_ac:.3f}  inhib_mc={s_inhib_mc:.3f}", flush=True)
@@ -482,17 +563,17 @@ def run_dot_task(param, task_args=None):
     # 5% sparsity
     gen_a = torch.Generator(device="cpu").manual_seed(args.seed + 10)
     gc_pc_mask_a = (torch.rand(n_gc, args.n_pc, generator=gen_a)
-                    < args.gc_pc_sparsity).float().to(DEVICE)
+                    < s_gc_pc1S).float().to(DEVICE)
     W_gc_pc_a = gc_pc_mask_a * torch.rand(n_gc, args.n_pc, device=DEVICE)
     W_gc_pc_a = (W_gc_pc_a / gc_pc_mask_a.sum(0).mean().clamp(min=1.0).sqrt()
-                 ) * s_gc_pc1 * args.gain_gc_pc
+                 ) * s_gc_pc1
 
     gen_t = torch.Generator(device="cpu").manual_seed(args.seed + 11)
     gc_pc_mask_t = (torch.rand(n_gc, args.n_pc, generator=gen_t)
-                    < args.gc_pc_sparsity).float().to(DEVICE)
+                    < s_gc_pc2S).float().to(DEVICE)
     W_gc_pc_t = gc_pc_mask_t * torch.rand(n_gc, args.n_pc, device=DEVICE)
     W_gc_pc_t = (W_gc_pc_t / gc_pc_mask_t.sum(0).mean().clamp(min=1.0).sqrt()
-                 ) * s_gc_pc2 * args.gain_gc_pc
+                 ) * s_gc_pc2
 
     feat_gc_pc_a = Weight(name="w_gc_pc_a", value=W_gc_pc_a)
     net.add_connection(
@@ -509,14 +590,14 @@ def run_dot_task(param, task_args=None):
     # PLACE to ASSOCIATION connection 10% sparsity
     dense_fan = float(2 * args.n_pc)
     pc_ac_a_mask = (torch.rand(args.n_pc, args.ac, generator=gen_a) 
-                    <= args.pc_ac_sparsity).float().to(DEVICE)
+                    <= s_pc_ac1S).float().to(DEVICE)
     # decrease agent place cell influence slightly
     W_pc_ac_a = (pc_ac_a_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
-                 / np.sqrt(dense_fan)) * s_pc_ac1 * args.gain_pc_ac
+                 / np.sqrt(dense_fan)) * s_pc_ac1
     pc_ac_t_mask = (torch.rand(args.n_pc, args.ac, generator=gen_t) 
-                        <= args.pc_ac_sparsity).float().to(DEVICE)
+                        <= s_pc_ac2S).float().to(DEVICE)
     W_pc_ac_t = (pc_ac_t_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
-                 / np.sqrt(dense_fan)) * s_pc_ac2 * args.gain_pc_ac
+                 / np.sqrt(dense_fan)) * s_pc_ac2
 
     feat_pc_ac_a = Weight(name="w_pc_ac_a", value=W_pc_ac_a)
     net.add_connection(
@@ -548,15 +629,11 @@ def run_dot_task(param, task_args=None):
     # association to motor layer, the only learning layer
     ac_mc_gen = torch.Generator(device="cpu").manual_seed(args.seed + 4)
     ac_mc_mask_gen = (torch.rand(args.ac, n_mc, generator=ac_mc_gen)
-                  < args.ac_mc_sparsity).to(DEVICE) # 20% sparsity for ac->mc
+                  < s_ac_mcS).to(DEVICE) 
 
     ac_mc_mask = Mask(name='ac_mc_mask', value=ac_mc_mask_gen)
 
-    # The w_ac_mc gene is one value per (AC neuron, ACTION) -- args.ac * moveChoices
-    # -- not per (AC neuron, MC neuron). Each value is broadcast across the mc_pop
-    # neurons of its action subpopulation, so EVOL searches args.ac * moveChoices
-    # dimensions (5000 here) while MSTDPET still refines all args.ac * n_mc synapses
-    # individually over the lifetime. A full per-synapse gene is also accepted.
+
     n_gene_action = args.ac * moveChoices
     n_gene_dense = args.ac * n_mc
     raw = np.asarray(param["param"]["w_ac_mc"], dtype=np.float32).ravel()
@@ -576,7 +653,7 @@ def run_dot_task(param, task_args=None):
             f"array: [{n_gene_dense}] (per synapse). Fix task_dotTracing.yaml."
         )
     # apply the evolved scaling number to the acmc weight
-    W_ac_mc = ac_mc_mask_gen * W_ac_mc * s_ac_mc * args.gain_ac_mc
+    W_ac_mc = ac_mc_mask_gen * W_ac_mc * s_ac_mc
  
     feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc, range=[0,5],
                         learning_rule=MSTDPET, nu=[args.nu, args.nu])
@@ -606,10 +683,14 @@ def run_dot_task(param, task_args=None):
 
     net.to(DEVICE)
 
-    print(f"[arch] GC {n_gc} x2  ->  PC {args.n_pc} x2 (sparse "
-          f"{args.gc_pc_sparsity:.0%})  ->  AC {args.ac} (dense)  ->  MC {n_mc}")
-    print(f"[gate] view_r={args.view_r} on a {dim}x{dim} board: target is visible "
-          f"when Chebyshev distance <= {args.view_r}")
+    features = {
+        "w_gc_pc_a": feat_gc_pc_a, "w_gc_pc_t": feat_gc_pc_t,
+        "w_pc_ac_a": feat_pc_ac_a, "w_pc_ac_t": feat_pc_ac_t,
+        "w_rec": feat_rec, "w_ac_mc": feat_ac_mc, "ac_mc_mask": ac_mc_mask,
+        "w_mc_opp": feat_mc_opp,
+    }
+    if weights_path:
+        loadWeights(weights_path, features)
 
     spikes = {}
     for layer in net.layers:
@@ -627,8 +708,8 @@ def run_dot_task(param, task_args=None):
 
     print("Training:")
     environment.addFileSuffix("train")
-    train_fitness = runSimulator(
-        net, environment, spikes, args.trn_eps, W_grid, peak,
+    train_fitness, train_ac = runSimulator(
+        net, environment, spikes, trn_eps, W_grid, peak,
         gran=args.granularity,
         rfname=genFileName("rew", "train"), pfname=genFileName("perf", "train"),
         view_r=args.view_r, dim=dim,
@@ -636,19 +717,65 @@ def run_dot_task(param, task_args=None):
     net.learning = False
     print("Testing:")
     environment.changeFileSuffix("train", "test")
-    fitness = runSimulator(
-        net, environment, spikes, args.tst_eps, W_grid, peak,
-        gran=args.granularity,
-        rfname=genFileName("rew", "test"), pfname=genFileName("perf", "test"),
-        view_r=args.view_r, dim=dim,
-    )
+    if tst_eps > 0:
+        reward_fitness, ac_frac = runSimulator(
+            net, environment, spikes, tst_eps, W_grid, peak,
+            gran=args.granularity,
+            rfname=genFileName("rew", "test"), pfname=genFileName("perf", "test"),
+            view_r=args.view_r, dim=dim,
+        )
+    else:
+        reward_fitness, ac_frac = train_fitness, train_ac
 
-    # task_dotTracing.main() indexes outP['fitnessScore'], so return a dict.
-    return {
+    ac_miss = distanceOutside(ac_frac, ac_lo, ac_hi)
+    if run_phase == "sparsity":
+        # only the upstream genes are moving; score how close AC is to target
+        fitness = SPARSITY_FITNESS_FLOOR - ac_miss
+    elif run_phase == "motor":
+        fitness = reward_fitness - float(phase_cfg.get("ac_penalty", 0.0)) * ac_miss
+    else:
+        fitness = reward_fitness
+    print(f"[fitness] phase={run_phase or 'none'} AC active {ac_frac:.1%} "
+          f"(target {ac_lo:.0%}-{ac_hi:.0%}) reward {reward_fitness:.4f} "
+          f"-> fitness {fitness:.4f}", flush=True)
+
+    out = {
         "fitnessScore": float(fitness),
         "train_fitness": float(train_fitness),
+        "reward_fitness": float(reward_fitness),
+        "ac_active_frac": float(ac_frac),
+        "phase": run_phase,
         "out_path": OUT_FILE_PATH,
     }
+    if save_weights:
+        out["weights_path"] = os.path.join(OUT_FILE_PATH, "weights.pt")
+        saveWeights(out["weights_path"], features, param, {
+            "fitnessScore": out["fitnessScore"],
+            "reward_fitness": out["reward_fitness"],
+            "ac_active_frac": out["ac_active_frac"],
+            "trn_eps": trn_eps, "tst_eps": tst_eps,
+        })
+
+    # task_dotTracing.main() indexes outP['fitnessScore'], so return a dict.
+    return out
+
+
+def episodeFileName(base, ep):
+    """Per-episode sibling of a genFileName() path.
+
+    `<dir>/rew_s1234_train.csv` -> `<dir>/rew_s1234_train_ep00007.csv`.
+    Zero-padded so a plain `ls`/glob sorts in episode order.
+    """
+    root, ext = os.path.splitext(base)
+    return f"{root}_ep{ep:05d}{ext}"
+
+
+def genFileName(ftype, suffix=""):
+    t = time.time()
+    t = int(1e10 * (t - 1e6 * (t // 1e6)))
+    os.makedirs(OUT_FILE_PATH, exist_ok=True)
+    return os.path.join(OUT_FILE_PATH,
+                        ftype + "_s" + str(t) + "_" + suffix + ".csv")
 
 
 # --------------------------------------------------------------------------- #
@@ -671,7 +798,12 @@ def standaloneParam(yaml_path=None):
 
 
 if __name__ == "__main__":
-    out = run_dot_task(standaloneParam())
+    if args.load_weights:
+        # fresh model from a saved candidate: same genes, then its weights
+        saved_genes = torch.load(args.load_weights, map_location="cpu")["genes"]
+        out = run_dot_task({"param": saved_genes}, weights_path=args.load_weights)
+    else:
+        out = run_dot_task(standaloneParam())
     print("\n[standalone] result")
     for k, v in out.items():
         print(f"  {k}: {v}")
