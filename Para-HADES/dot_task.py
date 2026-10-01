@@ -9,9 +9,17 @@ import itertools
 import os
 import time
 
+import matplotlib
+matplotlib.use("Agg")   
+
 import numpy as np
 import torch
+from PIL import Image
 
+import matplotlib.pyplot as plt
+from mpl_toolkits.axes_grid1 import make_axes_locatable
+
+from bindsnet.analysis.plotting import plot_spikes
 from bindsnet.encoding import poisson
 from bindsnet.environment.dot_simulator import DotSimulator
 from bindsnet.learning.MCC_learning import MSTDPET
@@ -61,9 +69,25 @@ parser.add_argument("--make_sparse", type=str2bool, default=False)
 parser.add_argument("--load_weights", type=str, default=None)
 parser.add_argument("--save_weights", type=str2bool, default=False)
 
+# plotting (same outputs as examples/dotTracing/PR5.py). Every --render_every
+# episodes: weight heatmaps + AC->MC polar plot, a spike-raster GIF with one
+# frame per decision, and a whole-episode raster timeline PNG.
+parser.add_argument("--plot", type=str2bool, default=True)
+parser.add_argument("--render_every", type=int, default=10)
+parser.add_argument("--replay_fps", type=int, default=20)
+# board replay: the dot-tracing episode itself (target trail, agent, view box)
+parser.add_argument("--render_replays", type=str2bool, default=True)
+parser.add_argument("--raster_replays", type=str2bool, default=True)
+parser.add_argument("--raster_timeline", type=str2bool, default=True)
+parser.add_argument("--raster_layers", type=str, nargs="+",
+                    default=["PC_A", "PC_T", "AC", "MC"])
+# 0 plots EVERY neuron in the layer; a positive value draws an evenly spaced
+# subsample instead.
+parser.add_argument("--raster_max_neurons", type=int, default=0)
+
 # GC layer 
-parser.add_argument("--gc_scales", type=int, nargs="+", default=[3, 5, 7, 11, 13])
-parser.add_argument("--gc_rotations", type=int, default=7)
+parser.add_argument("--gc_scales", type=int, nargs="+", default=[3, 5, 7, 11])
+parser.add_argument("--gc_rotations", type=int, default=6)
 parser.add_argument("--gc_offsets", type=int, default=16)   # 4x4 phase grid
 parser.add_argument("--gc_global_scale", type=float, default=1.0)  # paper's g
 parser.add_argument("--gc_sharpness", type=float, default=1.0)     # paper's k
@@ -112,7 +136,7 @@ LAYER_GCA, LAYER_GCT = "GC_A", "GC_T"      # grid code at agent / at target
 LAYER_PCA, LAYER_PCT = "PC_A", "PC_T"      # place cells for agent / target
 LAYER_AC, LAYER_MC = "AC", "MC"
 
-OUT_FILE_PATH = "dotTracing_out3" + os.sep
+OUT_FILE_PATH = "dotTracing_out6" + os.sep
 
 # Fallback evaluation counter. One task process evaluates several candidates
 # (task_dotTracing.main loops genes x repeats), and every one of them used to
@@ -161,7 +185,7 @@ OPPONENT_PAIRS = [(1, 3), (2, 4)]          # up<->down, right<->left
 # (per-step reward is bounded by ~sqrt(2) + 10 on intercept), so once the motor
 # phase starts every motor-phase record outranks the sparsity-phase history the
 # optimizers still read.
-SPARSITY_FITNESS_FLOOR = -100.0
+SPARSITY_FITNESS_FLOOR = -20.0
 PHASE_FILE = "motor_phase.json"
 
 
@@ -182,8 +206,6 @@ def readPhase(task_args):
         return None
 
 
-def distanceOutside(x, lo, hi):
-    return max(lo - x, 0.0, x - hi)
 
 
 # --------------------------------------------------------------------------- #
@@ -230,7 +252,8 @@ def wtaAction(mc_spikes, n_actions, rng):
 # TRAINING LOOP
 def runSimulator(net, env, spikes, episodes, W_grid, peak,
                  gran=100, rfname="", pfname="", view_r=14,
-                 dim=28):
+                 dim=28, feat_ac_mc=None, weight_features=None,
+                 replay_prefix="replay"):
     dt = net.dt
     peak_v = peak.squeeze(0)                       # (n_gc,) hoisted out of the loop
     zero_gc = torch.zeros(W_grid.shape[1], device=DEVICE)
@@ -246,6 +269,31 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
         net.reset_state_variables()
         env.reset()
         done = False
+
+        plotting = args.plot and args.render_every > 0 and ep % args.render_every == 0
+        capturing = plotting and (args.raster_replays or args.raster_timeline)
+        replaying = plotting and args.render_replays
+        replay_frames, env_fig = [], None
+        if replaying:
+            env_fig = EnvReplayFigure(dim, view_r)
+            replay_frames.append(env_fig.frame(
+                env, f"ep {ep}  initial state -- no decision yet"))
+        raster_frames, raster_windows = [], []
+        raster_ims = raster_axes = raster_fig = None
+        raster_sizes = {l: (net.layers[l].n if args.raster_max_neurons <= 0
+                            else min(net.layers[l].n, args.raster_max_neurons))
+                        for l in args.raster_layers}
+        if capturing and args.raster_replays:
+            blank = {l: torch.zeros(gran, raster_sizes[l])
+                     for l in args.raster_layers}
+            raster_ims, raster_axes = plot_spikes(
+                blank, ims=raster_ims, axes=raster_axes, figsize=(8, 12))
+            raster_fig = plt.gcf()
+            styleRasterAxes(raster_axes, args.raster_layers, gran,
+                            raster_sizes, first_call=True)
+            raster_fig.suptitle(f"ep {ep}  initial state -- no decision yet",
+                                fontsize=9)
+            raster_frames.append(captureFrame(raster_fig))
 
         action = int(rng.integers(0, env.action_space.n))
         last_active_ac = torch.zeros(net.layers[LAYER_AC].n, device=DEVICE)
@@ -331,6 +379,32 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
             total_reward += r
             intercepts += int(bool(intercept))
 
+            # save raster frames for the GIF replay / timeline
+            if capturing:
+                window = {
+                    l: rasterSubsample(
+                        spikes[l].get("s").squeeze().view(gran, -1),
+                        args.raster_max_neurons).detach().cpu()
+                    for l in args.raster_layers
+                }
+                if args.raster_timeline:
+                    raster_windows.append(window)
+                if args.raster_replays:
+                    raster_ims, raster_axes = plot_spikes(
+                        window, ims=raster_ims, axes=raster_axes,
+                        figsize=(8, 12))
+                    styleRasterAxes(raster_axes, args.raster_layers, gran,
+                                    raster_sizes)
+                    raster_fig.suptitle(f"ep {ep}  decision {step}  "
+                                        f"action {action}  r={r:+.2f}",
+                                        fontsize=9)
+                    raster_frames.append(captureFrame(raster_fig))
+
+            if replaying:
+                replay_frames.append(env_fig.frame(
+                    env, f"ep {ep}  step {step}  action {action}  r={r:+.2f}"
+                         + ("  INTERCEPT" if intercept else "")))
+
             if step % 25 == 0:
                 print(f"  step {step} ({time.time() - clock:.2f}s) "
                       f"r={r:+.3f}")
@@ -366,6 +440,33 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
                   f"fitness carries no signal about its genes. Check the "
                   f"--gain_* calibration and the layer thresholds.", flush=True)
         os.makedirs(OUT_FILE_PATH, exist_ok=True)
+        if replay_frames:
+            # Same frame count as the raster GIF (both open on the initial
+            # state), so frame i is the same instant in both.
+            saveReplayGIF(replay_frames,
+                          os.path.join(OUT_FILE_PATH,
+                                       f"{replay_prefix}_ep{ep:05d}.gif"),
+                          fps=args.replay_fps)
+        if env_fig is not None:
+            env_fig.close()
+        if raster_frames:
+            saveReplayGIF(raster_frames,
+                          os.path.join(OUT_FILE_PATH,
+                                       f"{replay_prefix}_raster_ep{ep:05d}.gif"),
+                          fps=args.replay_fps)
+        if raster_windows:
+            plotRasterTimeline(
+                raster_windows, args.raster_layers, gran, ep,
+                os.path.join(OUT_FILE_PATH,
+                             f"{replay_prefix}_rastertl_ep{ep:05d}.png"))
+        if raster_fig is not None:
+            plt.close(raster_fig)
+        if plotting and weight_features is not None:
+            plotWeightGraphs(weight_features, ep, OUT_FILE_PATH,
+                             prefix=replay_prefix)
+            if feat_ac_mc is not None:
+                plotMotorWeightPolar(feat_ac_mc.value, last_active_ac, ep,
+                                     OUT_FILE_PATH, prefix=replay_prefix)
         # One file per episode. Both of these used to be opened in append mode,
         # so every episode of a phase accumulated into the single name
         # genFileName() produced before the loop -- fine for a post-hoc average,
@@ -566,14 +667,14 @@ def run_dot_task(param, task_args=None, weights_path=None):
                     < s_gc_pc1S).float().to(DEVICE)
     W_gc_pc_a = gc_pc_mask_a * torch.rand(n_gc, args.n_pc, device=DEVICE)
     W_gc_pc_a = (W_gc_pc_a / gc_pc_mask_a.sum(0).mean().clamp(min=1.0).sqrt()
-                 ) * s_gc_pc1
+                 ) * s_gc_pc1 * 10
 
     gen_t = torch.Generator(device="cpu").manual_seed(args.seed + 11)
     gc_pc_mask_t = (torch.rand(n_gc, args.n_pc, generator=gen_t)
                     < s_gc_pc2S).float().to(DEVICE)
     W_gc_pc_t = gc_pc_mask_t * torch.rand(n_gc, args.n_pc, device=DEVICE)
     W_gc_pc_t = (W_gc_pc_t / gc_pc_mask_t.sum(0).mean().clamp(min=1.0).sqrt()
-                 ) * s_gc_pc2
+                 ) * s_gc_pc2 * 10
 
     feat_gc_pc_a = Weight(name="w_gc_pc_a", value=W_gc_pc_a)
     net.add_connection(
@@ -593,11 +694,11 @@ def run_dot_task(param, task_args=None, weights_path=None):
                     <= s_pc_ac1S).float().to(DEVICE)
     # decrease agent place cell influence slightly
     W_pc_ac_a = (pc_ac_a_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
-                 / np.sqrt(dense_fan)) * s_pc_ac1
+                 / np.sqrt(dense_fan)) * s_pc_ac1 * 10
     pc_ac_t_mask = (torch.rand(args.n_pc, args.ac, generator=gen_t) 
                         <= s_pc_ac2S).float().to(DEVICE)
     W_pc_ac_t = (pc_ac_t_mask * (torch.rand(args.n_pc, args.ac, device=DEVICE))
-                 / np.sqrt(dense_fan)) * s_pc_ac2
+                 / np.sqrt(dense_fan)) * s_pc_ac2 * 10
 
     feat_pc_ac_a = Weight(name="w_pc_ac_a", value=W_pc_ac_a)
     net.add_connection(
@@ -692,6 +793,11 @@ def run_dot_task(param, task_args=None, weights_path=None):
     if weights_path:
         loadWeights(weights_path, features)
 
+    weight_features = {"gc_pc_a": feat_gc_pc_a, "gc_pc_t": feat_gc_pc_t,
+                       "pc_ac_a": feat_pc_ac_a, "pc_ac_t": feat_pc_ac_t,
+                       "recurrent": feat_rec, "ac_mc": feat_ac_mc,
+                       "mc_opp": feat_mc_opp}
+
     spikes = {}
     for layer in net.layers:
         spikes[layer] = Monitor(net.layers[layer], state_vars=["s"],
@@ -712,7 +818,8 @@ def run_dot_task(param, task_args=None, weights_path=None):
         net, environment, spikes, trn_eps, W_grid, peak,
         gran=args.granularity,
         rfname=genFileName("rew", "train"), pfname=genFileName("perf", "train"),
-        view_r=args.view_r, dim=dim,
+        view_r=args.view_r, dim=dim, feat_ac_mc=feat_ac_mc,
+        weight_features=weight_features, replay_prefix="replay_train",
     )
     net.learning = False
     print("Testing:")
@@ -722,12 +829,13 @@ def run_dot_task(param, task_args=None, weights_path=None):
             net, environment, spikes, tst_eps, W_grid, peak,
             gran=args.granularity,
             rfname=genFileName("rew", "test"), pfname=genFileName("perf", "test"),
-            view_r=args.view_r, dim=dim,
+            view_r=args.view_r, dim=dim, feat_ac_mc=feat_ac_mc,
+            weight_features=weight_features, replay_prefix="replay_test",
         )
     else:
         reward_fitness, ac_frac = train_fitness, train_ac
 
-    ac_miss = distanceOutside(ac_frac, ac_lo, ac_hi)
+    ac_miss = max(ac_lo - ac_frac, 0.0, ac_frac - ac_hi)
     if run_phase == "sparsity":
         # only the upstream genes are moving; score how close AC is to target
         fitness = SPARSITY_FITNESS_FLOOR - ac_miss
@@ -758,6 +866,184 @@ def run_dot_task(param, task_args=None, weights_path=None):
 
     # task_dotTracing.main() indexes outP['fitnessScore'], so return a dict.
     return out
+
+
+# --------------------------------------------------------------------------- #
+# Plotting (ported from examples/dotTracing/PR5.py). out_path is passed in
+# explicitly: OUT_FILE_PATH is reassigned per candidate, so a default argument
+# would freeze whatever it was at import time.
+# --------------------------------------------------------------------------- #
+def plotWeightGraphs(weight_features, ep, out_path, prefix="replay"):
+    os.makedirs(out_path, exist_ok=True)
+    names = list(weight_features.keys())
+    fig, axes = plt.subplots(1, len(names), figsize=(6 * len(names), 5))
+    if len(names) == 1:
+        axes = [axes]
+    for ax, name in zip(axes, names):
+        data = weight_features[name].value.detach().to_dense().float().cpu().numpy()
+        vabs = max(abs(data.min()), abs(data.max())) or 1.0
+        im = ax.imshow(data, cmap="RdBu_r", vmin=-vabs, vmax=vabs, aspect="auto")
+        ax.set_title(name)
+        ax.set_xlabel("target neuron")
+        ax.set_ylabel("source neuron")
+        div = make_axes_locatable(ax)
+        plt.colorbar(im, cax=div.append_axes("right", size="5%", pad=0.05))
+    fig.suptitle(f"Synaptic Weights — {prefix} episode {ep}")
+    fig.tight_layout()
+    fname = os.path.join(out_path, f"{prefix}_weights_ep{ep:05d}.png")
+    fig.savefig(fname, bbox_inches="tight")
+    plt.close(fig)
+    return fname
+
+
+def plotMotorWeightPolar(w_ac_mc, active_mask, ep, out_path, prefix="replay"):
+    """
+    The paper's Figure 9: fraction of total AC->MC weight allocated to each motor
+    population, split by active vs inactive ACs at the current state.
+    """
+    os.makedirs(out_path, exist_ok=True)
+    W = w_ac_mc.detach().to_dense().float().cpu().numpy()
+    pops = np.array_split(np.arange(W.shape[1]), moveChoices)
+    act = active_mask.detach().cpu().numpy().astype(bool)
+    fig, ax = plt.subplots(subplot_kw={"projection": "polar"}, figsize=(5, 5))
+    ang = np.linspace(0, 2 * np.pi, moveChoices, endpoint=False)
+    for label, sel, colour in (("active", act, "r"), ("inactive", ~act, "b")):
+        if sel.sum() == 0:
+            continue
+        tot = W[sel].sum()
+        vals = np.array([W[sel][:, p].sum() for p in pops]) / (tot or 1.0)
+        ax.plot(np.append(ang, ang[0]), np.append(vals, vals[0]), colour, label=label)
+    ax.set_xticks(ang)
+    ax.set_xticklabels([f"a{i}" for i in range(moveChoices)])
+    ax.legend(loc="upper right")
+    ax.set_title(f"AC→MC weight allocation — {prefix} ep {ep}")
+    fname = os.path.join(out_path, f"{prefix}_motorpolar_ep{ep:05d}.png")
+    fig.savefig(fname, bbox_inches="tight")
+    plt.close(fig)
+    return fname
+
+
+def rasterSubsample(spk, max_n):
+    """(time, n) -> (time, <=max_n). Evenly spaced neuron subset, chosen so it does
+    not bias toward low indices. max_n <= 0 means keep every neuron."""
+    n = spk.shape[1]
+    if max_n <= 0 or n <= max_n:
+        return spk
+    idx = torch.linspace(0, n - 1, max_n, device=spk.device).long()
+    return spk[:, idx]
+
+
+def styleRasterAxes(axes, layers, gran, sizes, first_call=False):
+    """
+    Pin the raster axes every frame. plot_spikes() only calls set_offsets() when
+    reusing axes and never rescales, so matplotlib keeps whatever limits the FIRST
+    frame autoscaled to -- and since the opening frame is deliberately empty, that
+    is a degenerate range that squashes every later frame into a sliver.
+    """
+    for ax, layer in zip(axes, layers):
+        ax.set_xlim(0, gran)
+        ax.set_ylim(-1, sizes[layer])
+        ax.set_xticks(np.linspace(0, gran, 5))
+        ax.set_xlabel("")
+    axes[-1].set_xlabel(f"time within decision window (ms of {gran})")
+    if first_call:
+        axes[0].figure.subplots_adjust(top=0.86, bottom=0.13, hspace=0.6)
+
+
+def plotRasterTimeline(windows, layers, gran, ep, fname, max_points=400000):
+    """
+    Whole-episode spike raster: every decision window concatenated along x, with a
+    dashed line at each decision boundary.
+
+    `windows` is a list (one per decision) of {layer: (gran, n) bool tensors}.
+    """
+    if not windows:
+        return None
+    fig, axes = plt.subplots(len(layers), 1, sharex=True,
+                             figsize=(max(8.0, 0.09 * len(windows)), 2.2 * len(layers)))
+    if len(layers) == 1:
+        axes = [axes]
+    for ax, layer in zip(axes, layers):
+        full = torch.cat([w[layer] for w in windows], dim=0).cpu().numpy()
+        t, nidx = full.nonzero()
+        # Thin very dense rasters -- a scatter with millions of points is slow to
+        # draw and reads as a solid block anyway.
+        if t.size > max_points:
+            keep = np.linspace(0, t.size - 1, max_points).astype(int)
+            t, nidx = t[keep], nidx[keep]
+            ax.set_ylabel(f"{layer}\n(thinned)")
+        else:
+            ax.set_ylabel(layer)
+        ax.scatter(t, nidx, s=0.4, linewidths=0, color="k")
+        for b in range(gran, len(windows) * gran, gran):
+            ax.axvline(b, color="tab:red", lw=0.3, ls="--", alpha=0.5)
+        ax.set_xlim(0, len(windows) * gran)
+        ax.set_ylim(-1, full.shape[1])
+    axes[-1].set_xlabel(f"simulation time (ms) -- dashed = decision boundary "
+                        f"({gran} ms each, {len(windows)} decisions)")
+    fig.suptitle(f"Spike raster timeline -- episode {ep}")
+    fig.tight_layout()
+    fig.savefig(fname, bbox_inches="tight", dpi=110)
+    plt.close(fig)
+    return fname
+
+
+class EnvReplayFigure:
+    """
+    Board replay frames. Deliberately not env.render(): that scales env.obs in
+    place, can append to files / print pandas tables, and adopts whatever
+    figure is current -- which, mid-episode, is the raster figure.
+    """
+
+    def __init__(self, dim, view_r):
+        self.dim, self.view_r = dim, view_r
+        self.fig, self.ax = plt.subplots(figsize=(5, 5.4))
+        self.im = self.ax.imshow(np.zeros((dim, dim)), cmap="hot",
+                                 vmin=0.0, vmax=1.0, interpolation="nearest")
+        self.agent, = self.ax.plot([], [], "s", color="tab:cyan", ms=7,
+                                   mec="k", label="agent")
+        self.target, = self.ax.plot([], [], "o", mfc="none", mec="lime",
+                                    ms=10, mew=1.5, label="target")
+        self.view = plt.Rectangle((0, 0), 1, 1, fill=False, ls="--",
+                                  lw=0.8, ec="tab:cyan")
+        self.ax.add_patch(self.view)
+        self.ax.set_xlim(-0.5, dim - 0.5)
+        self.ax.set_ylim(dim - 0.5, -0.5)
+        self.ax.set_xticks([])
+        self.ax.set_yticks([])
+        self.ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.01),
+                       ncol=2, fontsize=8, frameon=False)
+
+    def frame(self, env, title):
+        ar, ac = int(env.netDot.row[0]), int(env.netDot.col[0])
+        tr, tc = int(env.dots[0].row[0]), int(env.dots[0].col[0])
+        self.im.set_data(np.clip(np.asarray(env.obs, dtype=float), 0.0, 1.0))
+        self.agent.set_data([ac], [ar])
+        self.target.set_data([tc], [tr])
+        v = self.view_r
+        self.view.set_bounds(ac - v - 0.5, ar - v - 0.5, 2 * v + 1, 2 * v + 1)
+        self.ax.set_title(title, fontsize=9)
+        return captureFrame(self.fig)
+
+    def close(self):
+        plt.close(self.fig)
+
+
+def captureFrame(fig=None):
+    fig = fig or plt.gcf()
+    fig.canvas.draw()
+    w, h = fig.canvas.get_width_height()
+    buf = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
+    return buf[:, :, :3].copy()
+
+
+def saveReplayGIF(frames, fname, fps=20):
+    if not frames:
+        return None
+    imgs = [Image.fromarray(f) for f in frames]
+    imgs[0].save(fname, save_all=True, append_images=imgs[1:],
+                 duration=int(1000 / fps), loop=0)
+    return fname
 
 
 def episodeFileName(base, ep):
