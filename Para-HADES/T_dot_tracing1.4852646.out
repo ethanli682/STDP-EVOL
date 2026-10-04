@@ -1,0 +1,261 @@
+-------------1---------------
+Job is running on node(s): pax034 
+Job is running on host: pax034 
+Job ID is: 4852646
+Job name is: T_dot_tracing1
+-------------2---------------
+nvidia-smi not found (CPU node)
+-------------3---------------
+-------------4---------------
+Job started!
+Sun Oct  4 12:23:13 AM EDT 2026
+-----------------------------
+------SLURM Env Debug-----
+SLURM_MEM_PER_CPU=
+SLURM_MEM=
+SLURM_MEM_PER_NODE=65536
+SLURM_CPUS_PER_TASK=24
+SLURM_CPUS_ON_NODE=24
+SLURM_NTASKS=1
+-----------------------------
+------Conda Exec-----
+
+EnvironmentNameNotFound: Could not find conda environment: delayW
+You can list all discoverable environments with `conda info --envs`.
+
+
+Running command in conda env delayW: python3 task_dotTracing.py --callBackScript /cluster/home/eli08/bindsnet/Para-HADES/GA.py --path ../Para-HADES_Tasks/dot_tracing1 --agent_idx 1 --agent_counter 0.0 --agent_test_num -1 --total_test_with_same_param 1 --total_testsGene_with_same_agent 5 --gpu False --slurm True --parallel False --evolutionTarget 1 --paramFile task_dotTracing.yaml
+---- Start Task ----- _04-10-2026-00-23-24-825601
+[gene] gc_pc=1.270/1.854  pc_ac=1.985/1.721  ac_mc=1.214  inhib_ac=2.001  inhib_mc=-1.411
+Task - candidate FAILED: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 159, in geneArray
+    v = param["param"][key]
+        ~~~~~~~~~~~~~~^^^^^
+KeyError: 'w_gc_pc_a'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/task_dotTracing.py", line 39, in run_task
+    outP = dot_tracingtask.do_task(param, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 546, in do_task
+    W_gc_pc_a = gc_pc_mask_a * geneMatrix(param, "w_gc_pc_a", n_gc, args.n_pc)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 183, in geneMatrix
+    a = geneArray(param, key, rows * cols)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 161, in geneArray
+    raise KeyError(
+KeyError: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+---- End Task ----- 04-10-2026-00-23-25-853104
+---- Task Total Time ----- 1.027458906173706 sec
+---- Start Task ----- _04-10-2026-00-23-25-862737
+[gene] gc_pc=0.964/1.585  pc_ac=1.754/1.769  ac_mc=1.225  inhib_ac=2.340  inhib_mc=-1.696
+Task - candidate FAILED: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 159, in geneArray
+    v = param["param"][key]
+        ~~~~~~~~~~~~~~^^^^^
+KeyError: 'w_gc_pc_a'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/task_dotTracing.py", line 39, in run_task
+    outP = dot_tracingtask.do_task(param, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 546, in do_task
+    W_gc_pc_a = gc_pc_mask_a * geneMatrix(param, "w_gc_pc_a", n_gc, args.n_pc)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 183, in geneMatrix
+    a = geneArray(param, key, rows * cols)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 161, in geneArray
+    raise KeyError(
+KeyError: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+---- End Task ----- 04-10-2026-00-23-26-684184
+---- Task Total Time ----- 0.821465253829956 sec
+---- Start Task ----- _04-10-2026-00-23-26-694966
+[gene] gc_pc=2.585/1.999  pc_ac=1.254/1.661  ac_mc=1.542  inhib_ac=0.877  inhib_mc=-1.066
+Task - candidate FAILED: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 159, in geneArray
+    v = param["param"][key]
+        ~~~~~~~~~~~~~~^^^^^
+KeyError: 'w_gc_pc_a'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/task_dotTracing.py", line 39, in run_task
+    outP = dot_tracingtask.do_task(param, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 546, in do_task
+    W_gc_pc_a = gc_pc_mask_a * geneMatrix(param, "w_gc_pc_a", n_gc, args.n_pc)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 183, in geneMatrix
+    a = geneArray(param, key, rows * cols)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 161, in geneArray
+    raise KeyError(
+KeyError: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+---- End Task ----- 04-10-2026-00-23-27-510231
+---- Task Total Time ----- 0.8152730464935303 sec
+---- Start Task ----- _04-10-2026-00-23-27-525431
+[gene] gc_pc=1.200/1.662  pc_ac=2.144/1.187  ac_mc=0.585  inhib_ac=1.834  inhib_mc=-1.576
+Task - candidate FAILED: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 159, in geneArray
+    v = param["param"][key]
+        ~~~~~~~~~~~~~~^^^^^
+KeyError: 'w_gc_pc_a'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/task_dotTracing.py", line 39, in run_task
+    outP = dot_tracingtask.do_task(param, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 546, in do_task
+    W_gc_pc_a = gc_pc_mask_a * geneMatrix(param, "w_gc_pc_a", n_gc, args.n_pc)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 183, in geneMatrix
+    a = geneArray(param, key, rows * cols)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 161, in geneArray
+    raise KeyError(
+KeyError: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+---- End Task ----- 04-10-2026-00-23-28-334404
+---- Task Total Time ----- 0.8089733123779297 sec
+---- Start Task ----- _04-10-2026-00-23-28-347841
+[gene] gc_pc=0.768/0.815  pc_ac=1.352/1.289  ac_mc=1.329  inhib_ac=1.759  inhib_mc=-2.056
+Task - candidate FAILED: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 159, in geneArray
+    v = param["param"][key]
+        ~~~~~~~~~~~~~~^^^^^
+KeyError: 'w_gc_pc_a'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/task_dotTracing.py", line 39, in run_task
+    outP = dot_tracingtask.do_task(param, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 546, in do_task
+    W_gc_pc_a = gc_pc_mask_a * geneMatrix(param, "w_gc_pc_a", n_gc, args.n_pc)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 183, in geneMatrix
+    a = geneArray(param, key, rows * cols)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 161, in geneArray
+    raise KeyError(
+KeyError: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+---- End Task ----- 04-10-2026-00-23-29-153032
+---- Task Total Time ----- 0.8052091598510742 sec
+---- Start Task ----- _04-10-2026-00-23-29-169886
+[gene] gc_pc=0.957/1.814  pc_ac=1.222/0.688  ac_mc=1.959  inhib_ac=1.365  inhib_mc=-0.951
+Task - candidate FAILED: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 159, in geneArray
+    v = param["param"][key]
+        ~~~~~~~~~~~~~~^^^^^
+KeyError: 'w_gc_pc_a'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/task_dotTracing.py", line 39, in run_task
+    outP = dot_tracingtask.do_task(param, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 546, in do_task
+    W_gc_pc_a = gc_pc_mask_a * geneMatrix(param, "w_gc_pc_a", n_gc, args.n_pc)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 183, in geneMatrix
+    a = geneArray(param, key, rows * cols)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 161, in geneArray
+    raise KeyError(
+KeyError: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+---- End Task ----- 04-10-2026-00-23-29-974464
+---- Task Total Time ----- 0.804593563079834 sec
+---- Start Task ----- _04-10-2026-00-23-29-984025
+[gene] gc_pc=1.879/1.414  pc_ac=1.220/0.470  ac_mc=1.445  inhib_ac=2.027  inhib_mc=-0.927
+Task - candidate FAILED: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 159, in geneArray
+    v = param["param"][key]
+        ~~~~~~~~~~~~~~^^^^^
+KeyError: 'w_gc_pc_a'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/task_dotTracing.py", line 39, in run_task
+    outP = dot_tracingtask.do_task(param, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 546, in do_task
+    W_gc_pc_a = gc_pc_mask_a * geneMatrix(param, "w_gc_pc_a", n_gc, args.n_pc)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 183, in geneMatrix
+    a = geneArray(param, key, rows * cols)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 161, in geneArray
+    raise KeyError(
+KeyError: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+---- End Task ----- 04-10-2026-00-23-30-785018
+---- Task Total Time ----- 0.8009934425354004 sec
+---- Start Task ----- _04-10-2026-00-23-30-800347
+[gene] gc_pc=1.121/0.790  pc_ac=1.747/0.089  ac_mc=1.141  inhib_ac=1.375  inhib_mc=-1.863
+Task - candidate FAILED: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 159, in geneArray
+    v = param["param"][key]
+        ~~~~~~~~~~~~~~^^^^^
+KeyError: 'w_gc_pc_a'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/task_dotTracing.py", line 39, in run_task
+    outP = dot_tracingtask.do_task(param, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 546, in do_task
+    W_gc_pc_a = gc_pc_mask_a * geneMatrix(param, "w_gc_pc_a", n_gc, args.n_pc)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 183, in geneMatrix
+    a = geneArray(param, key, rows * cols)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 161, in geneArray
+    raise KeyError(
+KeyError: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+---- End Task ----- 04-10-2026-00-23-31-600679
+---- Task Total Time ----- 0.800330638885498 sec
+---- Start Task ----- _04-10-2026-00-23-31-612634
+[gene] gc_pc=1.258/1.288  pc_ac=1.572/1.499  ac_mc=1.435  inhib_ac=1.148  inhib_mc=-2.208
+Task - candidate FAILED: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 159, in geneArray
+    v = param["param"][key]
+        ~~~~~~~~~~~~~~^^^^^
+KeyError: 'w_gc_pc_a'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/cluster/home/eli08/bindsnet/Para-HADES/task_dotTracing.py", line 39, in run_task
+    outP = dot_tracingtask.do_task(param, args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 546, in do_task
+    W_gc_pc_a = gc_pc_mask_a * geneMatrix(param, "w_gc_pc_a", n_gc, args.n_pc)
+                               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 183, in geneMatrix
+    a = geneArray(param, key, rows * cols)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/cluster/home/eli08/bindsnet/Para-HADES/dot_tracingtask.py", line 161, in geneArray
+    raise KeyError(
+KeyError: "gene 'w_gc_pc_a' missing from param['param']. task_dotTracing.yaml must declare it under `param:` with array: [280000]."
+---- End Task ----- 04-10-2026-00-23-32-412437
+---- Task Total Time ----- 0.7998104095458984 sec

@@ -1018,7 +1018,7 @@ if __name__ == "__main__":
     parser.add_argument("--evolutionType", type=str, default='CondVAE') # GA, CMA_ES, SNES, etc. Comma-separated for multiple (e.g. GA,CMA_ES,SNES) - randomly picks one per agent
     
     # Example - Find the Siquence task
-    parser.add_argument("--path", type=str, default='../Para-HADES_Tasks/test_directory')   #ES_FindSeq    # pass to the next process
+    parser.add_argument("--path", type=str, default='../Para-HADES_Tasks/dot_tracing2')   #ES_FindSeq    # pass to the next process
     parser.add_argument("--paramFile", type=str, default='task_dotTracing.yaml')      # pass to the next process
     parser.add_argument("--taskFilename", type=str, default='task_dotTracing.py')      # pass to the next process
     parser.add_argument("--evolutionTarget", type=int, default=1)      # 1 = Max, -1 = Min

@@ -42,8 +42,8 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--dim", type=int, default=28)
 parser.add_argument("--granularity", type=int, default=100)
 parser.add_argument("--dt", type=float, default=1.0)
-parser.add_argument("--trn_eps", type=int, default=100)
-parser.add_argument("--tst_eps", type=int, default=50)
+parser.add_argument("--trn_eps", type=int, default=5)
+parser.add_argument("--tst_eps", type=int, default=5)
 parser.add_argument("--decay", type=int, default=4)
 parser.add_argument("--herrs", type=int, default=0)
 parser.add_argument("--diag", type=str2bool, default=False)
@@ -85,18 +85,15 @@ parser.add_argument("--gc_max_rate", type=float, default=80.0)     # 8 spikes / 
 
 # PLACE CELL layers: one for the agent, one for the target
 parser.add_argument("--n_pc", type=int, default=500)          # per place layer
-parser.add_argument("--gc_pc_sparsity", type=float, default=0.05) 
 parser.add_argument("--pc_lbound", type=float, default=-80.0)
 
 # ASSOCIATION layer 
 parser.add_argument("--ac", type=int, default=1000) 
 parser.add_argument("--gc_ac_sparsity", type=float, default=0.12)
-parser.add_argument("--pc_ac_sparsity", type=float, default=0.1)
 parser.add_argument("--ac_lbound", type=float, default=-80.0) 
 
 # MOTOR layer 100 neurons per move (5 moves)
 parser.add_argument("--mc_pop", type=int, default=100)
-parser.add_argument("--ac_mc_sparsity", type=float, default=0.20)
 parser.add_argument("--ac_mc_init", type=float, default=0.3)
 parser.add_argument("--mc_lbound", type=float, default=-80.0)
 parser.add_argument("--w_max", type=float, default=1.0)
@@ -171,18 +168,6 @@ def geneArray(param, key, n):
     return a
 
 
-def geneMatrix(param, key, rows, cols):
-    """A weight-matrix gene: the DENSE (rows, cols) matrix flattened row-major.
-
-    Every synaptic pathway in this network draws its weights from a gene of this
-    shape, so EVOL searches the whole connectome rather than a handful of gains.
-    The connectivity mask is applied by the caller AFTER the reshape, so the gene
-    length stays a constant the YAML can declare instead of depending on how many
-    synapses a particular mask seed happened to open.
-    """
-    a = geneArray(param, key, rows * cols)
-    return torch.from_numpy(a).to(DEVICE).view(rows, cols)
-
 # select action based on the largest spiking population
 def wtaAction(mc_spikes, n_actions, rng):
     """mc_spikes: (time, n_mc) -> action index. Aggregate count per subpopulation."""
@@ -242,7 +227,7 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
         clock = time.time()
         ac_frac_sum, mc_frac_sum = 0.0, 0.0
 
-        avg_reward = 0
+        sum_reward = 0
 
         while not done:
             step += 1
@@ -266,7 +251,7 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
             if intercept:
                 r += 10.0
 
-            avg_reward += r
+            sum_reward += r
                 
             # decrease reward over time
             if args.make_sparse: 
@@ -354,13 +339,13 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
                 clock = time.time()
 
         # create a sliding history window of past rewards
-        if len(past_performances) < 25:
-            past_performances.insert(0,avg_reward/100)
+        if len(past_performances) < args.trn_eps:
+            past_performances.insert(0,sum_reward/100)
         else:
-            past_performances.insert(0,avg_reward/100)
+            past_performances.insert(0,sum_reward/100)
             past_performances.pop()
             avg_perf = sum(past_performances)/len(past_performances)
-            print(f"AVERAGE REWARD PAST 25: {avg_perf}", flush=True)
+            print(f"AVERAGE REWARD PAST 5: {avg_perf}", flush=True)
 
         if net.reward_fn is not None:
             net.reward_fn.update(accumulated_reward=total_reward, steps=step)
@@ -384,16 +369,16 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
                           os.path.join(OUT_FILE_PATH,
                                        f"{replay_prefix}_raster_ep{ep:05d}.gif"),
                           fps=replay_fps)
-        if capturing and raster_windows:
-            plotRasterTimeline(
-                raster_windows, args.raster_layers, gran, ep,
-                os.path.join(OUT_FILE_PATH,
-                             f"{replay_prefix}_rastertl_ep{ep:05d}.png"))
+        # if capturing and raster_windows:
+        #     plotRasterTimeline(
+        #         raster_windows, args.raster_layers, gran, ep,
+        #         os.path.join(OUT_FILE_PATH,
+        #                      f"{replay_prefix}_rastertl_ep{ep:05d}.png"))
         if capturing and raster_fig is not None:
             plt.close(raster_fig)
         if weight_features is not None and ep % render_every == 0:
             plotWeightGraphs(weight_features, ep)
-            plotMotorWeightPolar(feat_ac_mc.value, last_active_ac, ep)
+            # plotMotorWeightPolar(feat_ac_mc.value, last_active_ac, ep)
         if args.write and rfname:
             with open(rfname, "ab") as f:
                 np.savetxt(f, rewards, delimiter=",", fmt="%.6f")
@@ -403,16 +388,16 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
         if ep % args.fcycle == 0:
             env.cycleOutFiles()
 
-    # use the average performance of final 25 as the fitness score
+    # use the average performance of final 5 as the fitness score
     if not past_performances:
         return 0.0
     return sum(past_performances)/len(past_performances)
 
 
-def run_task(param, task_args=None):
+def do_task(param, task_args=None):
     """
     param      -- one Para-HADES candidate. param['param'] holds the decoded
-                  genes: w_ac_mc plus the six/seven scalers.
+                  genes: one sparsity_* per pathway plus the scalers.
     task_args  -- the Para-HADES slurm namespace (path, agent_idx, ...). It is
                   NOT the config namespace; deliberately not named `args` so it
                   cannot shadow the module-level parser defaults, which are what
@@ -536,21 +521,38 @@ def run_task(param, task_args=None):
     net.add_layer(ac,   name=LAYER_AC)
     net.add_layer(mc,   name=LAYER_MC)
 
+    # ---- decode the sparsity genes ---------------------------------------- #
+    # Each pathway evolves its connection PROBABILITY, not its weight matrix. The
+    # mask is `fixed_uniform_draw < sparsity`, so raising a gene only ADDS synapses
+    # (the ones already present stay), which keeps the fitness landscape smooth for
+    # ES. The weight values themselves are fixed draws from args.seed.
+    p_gc_pc_a = geneScalar(param, "sparsity_gc_pc_a")
+    p_gc_pc_t = geneScalar(param, "sparsity_gc_pc_t")
+    p_pc_ac_a = geneScalar(param, "sparsity_pc_ac_a")
+    p_pc_ac_t = geneScalar(param, "sparsity_pc_ac_t")
+    p_rec     = geneScalar(param, "sparsity_rec")
+    p_ac_mc   = geneScalar(param, "sparsity_ac_mc")
+    p_mc_opp  = geneArray(param, "sparsity_mc_opp", 2 * len(OPPONENT_PAIRS))
+    print(f"[gene] sparsity gc_pc={p_gc_pc_a:.3f}/{p_gc_pc_t:.3f}  "
+          f"pc_ac={p_pc_ac_a:.3f}/{p_pc_ac_t:.3f}  rec={p_rec:.3f}  "
+          f"ac_mc={p_ac_mc:.3f}  mc_opp={[round(float(v), 3) for v in p_mc_opp]}",
+          flush=True)
+
+    # weight values: separate generator so the mask streams are unaffected
+    w_gen = torch.Generator(device="cpu").manual_seed(args.seed + 20)
+
     # grid cell to place cell connections
-    # 5% sparsity
-    # The mask (which synapses exist) is fixed architecture drawn from args.seed;
-    # the weights themselves are the w_gc_pc_* genes.
     gen_a = torch.Generator(device="cpu").manual_seed(args.seed + 10)
     gc_pc_mask_a = (torch.rand(n_gc, args.n_pc, generator=gen_a)
-                    < args.gc_pc_sparsity).float().to(DEVICE)
-    W_gc_pc_a = gc_pc_mask_a * geneMatrix(param, "w_gc_pc_a", n_gc, args.n_pc)
+                    < p_gc_pc_a).float().to(DEVICE)
+    W_gc_pc_a = gc_pc_mask_a * torch.rand(n_gc, args.n_pc, generator=w_gen).to(DEVICE)
     W_gc_pc_a = (W_gc_pc_a / gc_pc_mask_a.sum(0).mean().clamp(min=1.0).sqrt()
                  ) * s_gc_pc1
 
     gen_t = torch.Generator(device="cpu").manual_seed(args.seed + 11)
     gc_pc_mask_t = (torch.rand(n_gc, args.n_pc, generator=gen_t)
-                    < args.gc_pc_sparsity).float().to(DEVICE)
-    W_gc_pc_t = gc_pc_mask_t * geneMatrix(param, "w_gc_pc_t", n_gc, args.n_pc)
+                    < p_gc_pc_t).float().to(DEVICE)
+    W_gc_pc_t = gc_pc_mask_t * torch.rand(n_gc, args.n_pc, generator=w_gen).to(DEVICE)
     W_gc_pc_t = (W_gc_pc_t / gc_pc_mask_t.sum(0).mean().clamp(min=1.0).sqrt()
                  ) * s_gc_pc2
 
@@ -566,16 +568,17 @@ def run_task(param, task_args=None):
                                    pipeline=[feat_gc_pc_t], device=DEVICE),
         source=LAYER_GCT, target=LAYER_PCT)
 
-    # PLACE to ASSOCIATION connection 10% sparsity
+    # PLACE to ASSOCIATION connection
     dense_fan = float(2 * args.n_pc)
-    pc_ac_a_mask = (torch.rand(args.n_pc, args.ac, generator=gen_a) 
-                    <= args.pc_ac_sparsity).float().to(DEVICE)
-    # decrease agent place cell influence slightly
-    W_pc_ac_a = (pc_ac_a_mask * geneMatrix(param, "w_pc_ac_a", args.n_pc, args.ac)
+    pc_ac_a_mask = (torch.rand(args.n_pc, args.ac, generator=gen_a)
+                    < p_pc_ac_a).float().to(DEVICE)
+    W_pc_ac_a = (pc_ac_a_mask
+                 * torch.rand(args.n_pc, args.ac, generator=w_gen).to(DEVICE)
                  / np.sqrt(dense_fan)) * s_pc_ac1
-    pc_ac_t_mask = (torch.rand(args.n_pc, args.ac, generator=gen_t) 
-                        <= args.pc_ac_sparsity).float().to(DEVICE)
-    W_pc_ac_t = (pc_ac_t_mask * geneMatrix(param, "w_pc_ac_t", args.n_pc, args.ac)
+    pc_ac_t_mask = (torch.rand(args.n_pc, args.ac, generator=gen_t)
+                    < p_pc_ac_t).float().to(DEVICE)
+    W_pc_ac_t = (pc_ac_t_mask
+                 * torch.rand(args.n_pc, args.ac, generator=w_gen).to(DEVICE)
                  / np.sqrt(dense_fan)) * s_pc_ac2
 
     feat_pc_ac_a = Weight(name="w_pc_ac_a", value=W_pc_ac_a)
@@ -590,11 +593,13 @@ def run_task(param, task_args=None):
                                    pipeline=[feat_pc_ac_t], device=DEVICE),
         source=LAYER_PCT, target=LAYER_AC)
 
-    # Recurrent association layer connection reservoir, no learning done
-    # The reservoir is dense, so there is no mask: the gene IS the matrix. It is
-    # declared signed in the YAML (min -1 / max 1) because it replaces a randn()
-    # draw and the layer needs both excitatory and inhibitory recurrence.
-    W_rec = geneMatrix(param, "w_rec", args.ac, args.ac)
+    # Recurrent association layer connection reservoir, no learning done.
+    # Signed randn() weights so the layer gets both excitatory and inhibitory
+    # recurrence; sparsity_rec picks how many of them exist.
+    rec_gen = torch.Generator(device="cpu").manual_seed(args.seed + 12)
+    rec_mask = (torch.rand(args.ac, args.ac, generator=rec_gen)
+                < p_rec).float().to(DEVICE)
+    W_rec = rec_mask * torch.randn(args.ac, args.ac, generator=w_gen).to(DEVICE)
     # normalize each by sum of their columns and mult by scale factor
     # W_rec = W_rec / W_rec.abs().sum(0, keepdim=True).clamp(min=1e-6) 
     # YAML allows scaler_inhib_ac down to 0.0, and this is a DIVISOR, so clamp:
@@ -610,35 +615,12 @@ def run_task(param, task_args=None):
     # association to motor layer, the only learning layer
     ac_mc_gen = torch.Generator(device="cpu").manual_seed(args.seed + 4)
     ac_mc_mask_gen = (torch.rand(args.ac, n_mc, generator=ac_mc_gen)
-                  < args.ac_mc_sparsity).to(DEVICE) # 20% sparsity for ac->mc
+                      < p_ac_mc).to(DEVICE)
 
     ac_mc_mask = Mask(name='ac_mc_mask', value=ac_mc_mask_gen)
 
-    # The w_ac_mc gene is one value per (AC neuron, ACTION) -- args.ac * moveChoices
-    # -- not per (AC neuron, MC neuron). Each value is broadcast across the mc_pop
-    # neurons of its action subpopulation, so EVOL searches args.ac * moveChoices
-    # dimensions (5000 here) while MSTDPET still refines all args.ac * n_mc synapses
-    # individually over the lifetime. A full per-synapse gene is also accepted.
-    n_gene_action = args.ac * moveChoices
-    n_gene_dense = args.ac * n_mc
-    raw = np.asarray(param["param"]["w_ac_mc"], dtype=np.float32).ravel()
-    if raw.size == n_gene_action:
-        g = torch.from_numpy(
-            geneArray(param, "w_ac_mc", n_gene_action)).to(DEVICE)
-        W_ac_mc = g.view(args.ac, moveChoices).repeat_interleave(args.mc_pop, dim=1)
-    elif raw.size == n_gene_dense:
-        g = torch.from_numpy(
-            geneArray(param, "w_ac_mc", n_gene_dense)).to(DEVICE)
-        W_ac_mc = g.view(args.ac, n_mc)
-    else:
-        raise ValueError(
-            f"gene 'w_ac_mc' has {raw.size} values. With ac={args.ac}, "
-            f"mc_pop={args.mc_pop}, moveChoices={moveChoices} it must be "
-            f"array: [{n_gene_action}] (per action, broadcast) or "
-            f"array: [{n_gene_dense}] (per synapse). Fix task_dotTracing.yaml."
-        )
-    # apply the evolved scaling number to the acmc weight
-    W_ac_mc = ac_mc_mask_gen * W_ac_mc * s_ac_mc
+    # every existing synapse starts at ac_mc_init; MSTDPET shapes them from there
+    W_ac_mc = ac_mc_mask_gen * args.ac_mc_init * s_ac_mc
  
     feat_ac_mc = Weight(name="w_ac_mc", value=W_ac_mc, range=[0,5],
                         learning_rule=MSTDPET, nu=[args.nu, args.nu])
@@ -650,18 +632,19 @@ def run_task(param, task_args=None):
     # MOTOR opponent inhibition (MC -> MC, frozen)
     feat_mc_opp = None
     W_mc_opp = torch.zeros(n_mc, n_mc, device=DEVICE)
-    # scaler_inhib_mc is declared in the YAML as min -5.0 / max 0.0, i.e. the gene
-    # is ALREADY negative. Negating it here (as the original line did) would make
-    # opponent pairs excite each other, so use it as-is.
-    # w_mc_opp holds one MAGNITUDE per directed opponent block, in the order
-    # (a->b, b->a) for each entry of OPPONENT_PAIRS, so the two directions of a
-    # pair can evolve asymmetrically. s_inhib_mc supplies the (negative) sign.
-    g_opp = geneArray(param, "w_mc_opp", 2 * len(OPPONENT_PAIRS))
+    # scaler_inhib_mc is declared in the YAML as min -3.0 / max 0.0, i.e. the gene
+    # is ALREADY negative, so it is used as-is for every existing opponent synapse.
+    # sparsity_mc_opp holds one connection probability per directed opponent
+    # block, in the order (a->b, b->a) for each entry of OPPONENT_PAIRS, so the
+    # two directions of a pair can evolve asymmetrically.
+    opp_gen = torch.Generator(device="cpu").manual_seed(args.seed + 13)
     for i, (a, b) in enumerate(OPPONENT_PAIRS): # two pairs - up down and right left
         sa = slice(a * args.mc_pop, (a + 1) * args.mc_pop)
         sb = slice(b * args.mc_pop, (b + 1) * args.mc_pop)
-        W_mc_opp[sa, sb] = float(g_opp[2 * i]) * s_inhib_mc      # a inhibits b
-        W_mc_opp[sb, sa] = float(g_opp[2 * i + 1]) * s_inhib_mc  # b inhibits a
+        m_ab = torch.rand(args.mc_pop, args.mc_pop, generator=opp_gen) < float(p_mc_opp[2 * i])
+        m_ba = torch.rand(args.mc_pop, args.mc_pop, generator=opp_gen) < float(p_mc_opp[2 * i + 1])
+        W_mc_opp[sa, sb] = m_ab.float().to(DEVICE) * s_inhib_mc  # a inhibits b
+        W_mc_opp[sb, sa] = m_ba.float().to(DEVICE) * s_inhib_mc  # b inhibits a
 
     feat_mc_opp = Weight(name="w_mc_opp", value=W_mc_opp)
     net.add_connection(
@@ -677,7 +660,8 @@ def run_task(param, task_args=None):
         weight_features["mc_opp"] = feat_mc_opp
 
     print(f"[arch] GC {n_gc} x2  ->  PC {args.n_pc} x2 (sparse "
-          f"{args.gc_pc_sparsity:.0%})  ->  AC {args.ac} (dense)  ->  MC {n_mc}")
+          f"{p_gc_pc_a:.0%}/{p_gc_pc_t:.0%})  ->  AC {args.ac} "
+          f"(rec {p_rec:.0%})  ->  MC {n_mc}")
     print(f"[gate] view_r={args.view_r} on a {dim}x{dim} board: target is visible "
           f"when Chebyshev distance <= {args.view_r}")
 
@@ -862,39 +846,3 @@ def genFileName(ftype, suffix=""):
                         ftype + "_s" + str(t) + "_" + suffix + ".csv")
 
 
-# --------------------------------------------------------------------------- #
-# Standalone entry point. Para-HADES normally supplies `param`; when this file is
-# run directly there is no GA, so synthesise a candidate from the `param:` block
-# of task_dotTracing.yaml (midpoint of each declared range).
-# --------------------------------------------------------------------------- #
-def standaloneParam(yaml_path=None):
-    import yaml
-    yaml_path = yaml_path or os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "task_dotTracing.yaml")
-    with open(yaml_path) as f:
-        spec = (yaml.safe_load(f) or {}).get("param", {}) or {}
-    genes = {}
-    rng = np.random.default_rng(args.seed)
-    for key, d in spec.items():
-        n = int((d.get("array") or [1])[0])
-        lo, hi = float(d.get("min", 0.0)), float(d.get("max", 1.0))
-        if n == 1:
-            # A scaler: the midpoint of its range is the neutral standalone value.
-            genes[key] = [0.5 * (lo + hi)]
-        else:
-            # A weight matrix: a constant midpoint would make every neuron in the
-            # layer see the identical input, so draw uniformly over the declared
-            # range instead -- the same distribution the pre-gene code used.
-            genes[key] = rng.uniform(lo, hi, size=n).astype(np.float32).tolist()
-    return {"param": genes}
-
-
-# task_dotTracing.py (the Para-HADES worker) calls dot_tracingtask.do_task(param).
-do_task = run_task
-
-
-if __name__ == "__main__":
-    out = run_task(standaloneParam())
-    print("\n[standalone] result")
-    for k, v in out.items():
-        print(f"  {k}: {v}")
