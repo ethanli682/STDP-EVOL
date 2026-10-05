@@ -90,7 +90,8 @@ parser.add_argument("--pc_lbound", type=float, default=-80.0)
 # ASSOCIATION layer 
 parser.add_argument("--ac", type=int, default=1000) 
 parser.add_argument("--gc_ac_sparsity", type=float, default=0.12)
-parser.add_argument("--ac_lbound", type=float, default=-80.0) 
+parser.add_argument("--ac_lbound", type=float, default=-80.0)
+parser.add_argument("--ac_penalty", type=float, default=1.0)   # scales the punishment for distance from 50% AC activity
 
 # MOTOR layer 100 neurons per move (5 moves)
 parser.add_argument("--mc_pop", type=int, default=100)
@@ -191,6 +192,8 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
     spike_ims = spike_axes = None
 
     past_performances = []
+    out_of_range_cnter = 0
+    ac_penalty_sum = 0.0
 
     for ep in range(episodes):
         total_reward, intercepts, step = 0.0, 0, 0
@@ -338,11 +341,24 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
                       f"r={r:+.3f}")
                 clock = time.time()
 
+        # flag association layer activity outside the healthy 25%-75% band
+        ac_frac = ac_frac_sum / max(1, step)
+        ac_out_of_range = not (0.25 <= ac_frac <= 0.75)
+
+        # when AC activity is out of range, the punishment is the distance from
+        # the ideal firing rate (middle of the band) instead of task performance
+        ac_penalty = 0.0
+        if ac_out_of_range:
+            ac_penalty = args.ac_penalty * abs(ac_frac - 0.5)
+            ac_penalty_sum += ac_penalty
+            out_of_range_cnter += 1
+        perf = sum_reward/100
+
         # create a sliding history window of past rewards
         if len(past_performances) < args.trn_eps:
-            past_performances.insert(0,sum_reward/100)
+            past_performances.insert(0,perf)
         else:
-            past_performances.insert(0,sum_reward/100)
+            past_performances.insert(0,perf)
             past_performances.pop()
             avg_perf = sum(past_performances)/len(past_performances)
             print(f"AVERAGE REWARD PAST 5: {avg_perf}", flush=True)
@@ -354,8 +370,9 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
         print(f"Episode {ep}: total reward {total_reward:.2f}"
               f"intercepts {intercepts} "
               f"target visible {visible_steps / max(1, step):.0%} | "
-              f"AC active {ac_frac_sum / max(1, step):.1%}, "
-              f"MC active {mc_frac_sum / max(1, step):.1%} | ")
+              f"AC active {ac_frac:.1%}, "
+              f"MC active {mc_frac_sum / max(1, step):.1%} | "
+              f"AC penalty {ac_penalty:.3f}")
         os.makedirs(OUT_FILE_PATH, exist_ok=True)
         if capturing and replay_frames:
             saveReplayGIF(replay_frames,
@@ -387,8 +404,11 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
                 f.write(("," if ep else "") + str(intercepts))
         if ep % args.fcycle == 0:
             env.cycleOutFiles()
-
-    # use the average performance of final 5 as the fitness score
+    # AC was not sufficiently active: fitness is the (negative) average distance
+    # from the ideal firing rate over the out-of-range episodes
+    if out_of_range_cnter:
+        return -ac_penalty_sum / out_of_range_cnter
+    # AC in range: use the average performance of final 5 as the fitness score
     if not past_performances:
         return 0.0
     return sum(past_performances)/len(past_performances)
