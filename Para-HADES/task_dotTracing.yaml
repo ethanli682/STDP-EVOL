@@ -13,119 +13,72 @@ param:
   # ac_mc 0.20, rec 1.0 (dense).
   # ------------------------------------------------------------------ #
 
-  # ---- GRID CELL -> PLACE CELL (agent / target) ---------------------- #
-  sparsity_gc_pc_a:
-    type: float
-    array: [1]
-    name: GC_to_PC_A
-    round: 4
-    min: 0.0
-    max: 0.5
-    coevo_group: gc_pc_a
-  sparsity_gc_pc_t:
-    type: float
-    array: [1]
-    name: GC_to_PC_T
-    round: 4
-    min: 0.0
-    max: 0.5
-    coevo_group: gc_pc_t
+  # todo pass in stdp param
+  # evolve one layer at a time 50% +- 10
+  # create plots for the fitness over time
 
-  # ---- PLACE CELL -> ASSOCIATION (agent / target) -------------------- #
-  sparsity_pc_ac_a:
-    type: float
-    array: [1]
-    name: PC_A_to_AC
-    round: 4
-    min: 0.0
-    max: 0.5
-    coevo_group: pc_ac_a
-  sparsity_pc_ac_t:
-    type: float
-    array: [1]
-    name: PC_T_to_AC
-    round: 4
-    min: 0.0
-    max: 0.5
-    coevo_group: pc_ac_t
-
-  # ---- ASSOCIATION recurrent reservoir (signed randn weights) -------- #
-  sparsity_rec:
-    type: float
-    array: [1]
-    name: AC_to_AC
-    round: 4
-    min: 0.0
-    max: 1.0
-    coevo_group: rec
-
-  # ---- ASSOCIATION -> MOTOR, the plastic pathway --------------------- #
-  # Existing synapses start at --ac_mc_init * scaler_ac_mc; MSTDPET learns them.
-  sparsity_ac_mc:
-    type: float
-    array: [1]
-    name: AC_to_MC
-    round: 4
-    min: 0.0
-    max: 1.0
-    coevo_group: ac_mc
-
-  # ---- MOTOR opponent inhibition ------------------------------------- #
-  # One sparsity per directed opponent block: (up->down, down->up,
-  # right->left, left->right). The (negative) weight is scaler_inhib_mc.
-  sparsity_mc_opp:
-    type: float
-    array: [4]
-    name: MC_opponent
-    round: 4
-    min: 0.0
-    max: 1.0
-    coevo_group: mc_opp
+  # give the tc_decay, tc_trace
 
   # ---- per-pathway scalers (untagged -> the shared '_default' group) --- #
   scaler_gc_pc1: 
     type: float
-    array: [1]
     name: gc_pc1
     min: 0.0
-    max: 3.0
+    max: 5.0
   scaler_gc_pc2: 
     type: float
-    array: [1]
     name: gc_pc2
     min: 0.0
-    max: 3.0
-  scaler_pc_ac1: 
+    max: 5.0 
+  tc_decay:
     type: float
-    array: [1]
-    name: pc_ac1
-    min: 0.0
-    max: 3.0
-  scaler_pc_ac2: 
+    name: tc_decay
+    min: 20.0
+    max: 100.0
+  tc_trace:
     type: float
-    array: [1]
-    name: pc_ac2
-    min: 0.0
-    max: 3.0
-  scaler_ac_mc: 
-    type: float
-    array: [1]
-    name: ac_mc
-    min: 0.0
-    max: 3.0
-  scaler_inhib_ac: 
-    type: float
-    array: [1]
-    name: inhib_ac
-    min: 0.0
-    max: 3.0
-  scaler_inhib_mc: 
-    type: float
-    array: [1]
-    name: inhib_mc
-    min: -3.0
-    max: 0.0
+    name: tc_trace
+    min: 20.0
+    max: 100.0
+  # scaler_pc_ac1: 
+  #   type: float
+  #   array: [1]
+  #   name: pc_ac1
+  #   min: 0.0
+  #   max: 5.0
+  # scaler_pc_ac2: 
+  #   type: float
+  #   array: [1]
+  #   name: pc_ac2
+  #   min: 0.0
+  #   max: 5.0
+  # scaler_ac_mc: 
+  #   type: float
+  #   array: [1]
+  #   name: ac_mc
+  #   min: 0.0
+  #   max: 5.0
+  # scaler_inhib_ac: 
+  #   type: float
+  #   array: [1]
+  #   name: inhib_ac
+  #   min: 0.0
+  #   max: 5.0
+  # scaler_inhib_mc: 
+  #   type: float
+  #   array: [1]
+  #   name: inhib_mc
+  #   min: -5.0
+  #   max: 0.0
+  # w_ac_mc:
+  #   type:float
+  #   array:[5000]
+
   
+  # track the current evolution step
+# mode:
+#   val: 1
+
 
 main:
   Task_resource:
@@ -135,10 +88,11 @@ main:
     theadsPerCore: 2
     memory: '64GB'
     time: '00-23:59:59'
-    conda_env: 'delayW'
+    conda_env: 'Para-HADES'
     partition: 'preempt'
     exclude_nodes: ''
     path: '/logs_Task'
+
 
   Main_resource:
     type: CPU
@@ -147,7 +101,7 @@ main:
     theadsPerCore: 2
     memory: '64GB'
     time: '00-23:59:59'
-    conda_env: 'delayW'
+    conda_env: 'Para-HADES'
     partition: 'preempt'
     exclude_nodes: ''
     path: '/logs_Agent'

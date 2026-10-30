@@ -163,7 +163,8 @@ def safe_pickle_loads_isolated(payload, timeout_sec=30):
 
     return data
 
-def run(args, self=False, exc=False, params=None):
+# todo: add the currevo to part 2's call to run
+def run(args, self=False, exc=False, params=None,curr_evo=0):
     global dispatch_skipped_no_candidates
     
     # OVERloading agent_counter
@@ -240,12 +241,11 @@ def run(args, self=False, exc=False, params=None):
             excludeNodes= params['main']['Main_resource']['exclude_nodes'] if self else params['main']['Task_resource']['exclude_nodes'],
             condaEnv=params['main']['Main_resource']['conda_env'] if self else params['main']['Task_resource']['conda_env'],
             partition=params['main']['Main_resource']['partition'] if self else params['main']['Task_resource']['partition'],
-            singularity_image=params['main']['Main_resource'].get('singularity_image', '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif') if self else params['main']['Task_resource'].get('singularity_image', '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'),
             # run_mode gates singularity (default, OLD cluster) vs conda (NEW cluster).
             # Absent from the yaml -> 'singularity' -> unchanged behavior for every existing run.
             run_mode=params['main']['Main_resource'].get('run_mode', 'singularity') if self else params['main']['Task_resource'].get('run_mode', 'singularity'),
             command="python3 " + str(run_process).replace('[','').replace(']','').replace('\', \'',' ').replace('\'',''),
-            nextTask=temp_file,
+            nextTask=temp_file
         )
     
         if exc:
@@ -1005,7 +1005,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--num_of_agents", type=int, default=2)
-    parser.add_argument("--all_in_first_run", type=int, default=1) # if 1, all ageents will test all the initial genes on the first run
+    parser.add_argument("--all_in_first_run", type=int, default=0) # if 1, all ageents will test all the initial genes on the first run
     parser.add_argument("--total_test_with_same_param", type=int, default=1) # pass to the next process
     parser.add_argument("--total_testsGene_with_same_agent", type=int, default=5) # Hoe many genes to test in each agant
     parser.add_argument("--populationSize", type=int, default=5000)
@@ -1015,10 +1015,10 @@ if __name__ == "__main__":
     parser.add_argument("--slurm", type=str, default='False')      # pass to the next process
     parser.add_argument("--parallel", type=str, default='False')      # pass to the next process
 
-    parser.add_argument("--evolutionType", type=str, default='CondVAE') # GA, CMA_ES, SNES, etc. Comma-separated for multiple (e.g. GA,CMA_ES,SNES) - randomly picks one per agent
+    parser.add_argument("--evolutionType", type=str, default='CMA_ES') # GA, CMA_ES, SNES, etc. Comma-separated for multiple (e.g. GA,CMA_ES,SNES) - randomly picks one per agent
     
     # Example - Find the Siquence task
-    parser.add_argument("--path", type=str, default='../Para-HADES_Tasks/dot_tracing2')   #ES_FindSeq    # pass to the next process
+    parser.add_argument("--path", type=str, default='../Para-HADES_Tasks/dot_tracing22f')   #ES_FindSeq    # pass to the next process
     parser.add_argument("--paramFile", type=str, default='task_dotTracing.yaml')      # pass to the next process
     parser.add_argument("--taskFilename", type=str, default='task_dotTracing.py')      # pass to the next process
     parser.add_argument("--evolutionTarget", type=int, default=1)      # 1 = Max, -1 = Min

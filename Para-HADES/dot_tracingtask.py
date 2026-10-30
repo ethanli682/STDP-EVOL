@@ -39,6 +39,7 @@ parser = argparse.ArgumentParser()
 # task / env
 parser.add_argument("--steps", type=int, default=100)
 parser.add_argument("--seed", type=int, default=0)
+parser.add_argument("--env_seed", type=int, default=None)  # optional reproducible environment (0 means wall-clock in DotSimulator)
 parser.add_argument("--dim", type=int, default=28)
 parser.add_argument("--granularity", type=int, default=100)
 parser.add_argument("--dt", type=float, default=1.0)
@@ -61,9 +62,9 @@ parser.add_argument("--make_sparse", type=str2bool, default=False)
 
 # rendering 
 parser.add_argument("--render_replays", type=str2bool, default=True)
-parser.add_argument("--render_every", type=int, default=10)
+parser.add_argument("--render_every", type=int, default=3)
 parser.add_argument("--replay_fps", type=int, default=20)
-parser.add_argument("--plot_every", type=int, default=50)
+parser.add_argument("--plot_every", type=int, default=3)
 # Raster replays: for every episode that gets an env GIF, also emit a spike-raster
 # GIF with one frame per decision, plus a whole-episode raster timeline PNG.
 parser.add_argument("--raster_replays", type=str2bool, default=True)
@@ -76,8 +77,8 @@ parser.add_argument("--raster_layers", type=str, nargs="+",
 parser.add_argument("--raster_max_neurons", type=int, default=0)
 
 # GC layer 
-parser.add_argument("--gc_scales", type=int, nargs="+", default=[3, 5, 7, 11, 13])
-parser.add_argument("--gc_rotations", type=int, default=7)
+parser.add_argument("--gc_scales", type=int, nargs="+", default=[5, 7, 11, 13]) # dec by one
+parser.add_argument("--gc_rotations", type=int, default=6) # dec by one
 parser.add_argument("--gc_offsets", type=int, default=16)   # 4x4 phase grid
 parser.add_argument("--gc_global_scale", type=float, default=1.0)  # paper's g
 parser.add_argument("--gc_sharpness", type=float, default=1.0)     # paper's k
@@ -91,7 +92,7 @@ parser.add_argument("--pc_lbound", type=float, default=-80.0)
 parser.add_argument("--ac", type=int, default=1000) 
 parser.add_argument("--gc_ac_sparsity", type=float, default=0.12)
 parser.add_argument("--ac_lbound", type=float, default=-80.0)
-parser.add_argument("--ac_penalty", type=float, default=1.0)   # scales the punishment for distance from 50% AC activity
+parser.add_argument("--ac_penalty", type=float, default=1.0)   # scales the punishment for distance from the 25%-65% AC activity band
 
 # MOTOR layer 100 neurons per move (5 moves)
 parser.add_argument("--mc_pop", type=int, default=100)
@@ -135,16 +136,19 @@ OUT_FILE_PATH = "dotTracing_out" + os.sep
 
 
 OPPONENT_PAIRS = [(1, 3), (2, 4)]          # up<->down, right<->left
+AC_LO, AC_HI = 0.40, 0.60                  # healthy AC firing-rate band
 
 
 # --------------------------------------------------------------------------- #
 # Gene access. Para-HADES hands every `param:` entry back as a flat list, even
 # the array: [1] scalars, so unwrap before use.
 # --------------------------------------------------------------------------- #
-def geneScalar(param, key):
+def geneScalar(param, key, default=None):
     try:
         v = param["param"][key]
     except (TypeError, KeyError):
+        if default is not None:
+            return float(default)
         raise KeyError(
             f"gene '{key}' missing from param['param']. task_dotTracing.yaml must "
             f"declare it under `param:` with array: [1]."
@@ -184,7 +188,9 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
                  feat_ac_mc, gran=100, rfname="", pfname="",
                  weight_features=None, render_replays=False, render_every=25,
                  replay_fps=20, replay_prefix="replay", view_r=14,
-                 dim=28):
+                 dim=28, diagnostics=None, reward_type=2, target_spikes=8.0):
+    if not np.isfinite(target_spikes) or target_spikes <= 0:
+        raise ValueError("target_spikes must be finite and positive")
     dt = net.dt
     peak_v = peak.squeeze(0)                       # (n_gc,) hoisted out of the loop
     zero_gc = torch.zeros(W_grid.shape[1], device=DEVICE)
@@ -192,9 +198,16 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
     spike_ims = spike_axes = None
 
     past_performances = []
-    out_of_range_cnter = 0
-    ac_penalty_sum = 0.0
 
+    spike_mean_sums = {name: 0.0 for name in (
+        LAYER_GCA, LAYER_GCT, LAYER_PCA, LAYER_PCT, LAYER_AC, LAYER_MC)}
+    active_fraction_sums = dict.fromkeys(spike_mean_sums, 0.0)
+    active_spike_sums = dict.fromkeys(spike_mean_sums, 0.0)
+    active_neuron_windows = dict.fromkeys(spike_mean_sums, 0)
+    layer_fitness_sums = dict.fromkeys(spike_mean_sums, 0.0)
+    total_windows = 0
+
+    # Accumulate activity across all decision windows in this call.
     for ep in range(episodes):
         total_reward, intercepts, step = 0.0, 0, 0
         visible_steps = 0                          # how often the target was in view
@@ -226,9 +239,7 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
                 raster_frames.append(captureFrame(raster_fig))
 
         action = int(rng.integers(0, env.action_space.n))
-        last_active_ac = torch.zeros(net.layers[LAYER_AC].n, device=DEVICE)
         clock = time.time()
-        ac_frac_sum, mc_frac_sum = 0.0, 0.0
 
         sum_reward = 0
 
@@ -287,11 +298,40 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
             # run network with gridcell firing as input to get a move choice
             net.run(inputs=inputs, time=gran, reward=reward)
 
+            gca = spikes[LAYER_GCA].get("s").squeeze()         
+            gct = spikes[LAYER_GCT].get("s").squeeze()
+            pca = spikes[LAYER_PCA].get("s").squeeze()          
+            pct = spikes[LAYER_PCT].get("s").squeeze()
             mc = spikes[LAYER_MC].get("s").squeeze()          # (time, n_mc)
             ac = spikes[LAYER_AC].get("s").squeeze()
-            last_active_ac = (ac.sum(0) >= 4).float()
-            ac_frac_sum += last_active_ac.mean().item()
-            mc_frac_sum += (mc.sum(0) > 0).float().mean().item()
+
+            # Score each window separately: 50% participation, with active
+            # neurons individually close to target_spikes. Deviations cannot
+            # cancel across neurons or across windows.
+            total_windows += 1
+            for name, layer_spikes in (
+                (LAYER_GCA, gca), (LAYER_GCT, gct),
+                (LAYER_PCA, pca), (LAYER_PCT, pct),
+                (LAYER_AC, ac), (LAYER_MC, mc),
+            ):
+                counts = layer_spikes.float().reshape(-1, net.layers[name].n).sum(0)
+                active = counts > 0
+                active_fraction = active.float().mean().item()
+                participation_score = 1.0 - 2.0 * abs(active_fraction - 0.5)
+                active_counts = counts[active]
+                count_score = 0.0
+                if active_counts.numel():
+                    count_score = (
+                        1.0 - ((active_counts - target_spikes) / target_spikes).square()
+                    ).mean().item()
+                # Four times the original combined score: ideal +2, silence -2.
+                layer_fitness_sums[name] += 2.0 * (
+                    participation_score + count_score - 1.0
+                )
+                spike_mean_sums[name] += counts.mean().item()
+                active_fraction_sums[name] += active_fraction
+                active_spike_sums[name] += active_counts.sum().item()
+                active_neuron_windows[name] += active_counts.numel()
 
             # get the action from the most active motor cell population
             action = wtaAction(mc, env.action_space.n, rng)
@@ -341,27 +381,35 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
                       f"r={r:+.3f}")
                 clock = time.time()
 
-        # flag association layer activity outside the healthy 25%-75% band
-        ac_frac = ac_frac_sum / max(1, step)
-        ac_out_of_range = not (0.25 <= ac_frac <= 0.75)
+       
+        # when AC activity is out of range, the punishment scales with how far
+        # the firing rate is from the band, instead of task performance
+        # ac_penalty = 0.0
+        # if ac_out_of_range:
+        #     ac_penalty = args.ac_penalty * max(AC_LO - ac_frac, ac_frac - AC_HI)
+        #     ac_penalty_sum += ac_penalty
+        #     out_of_range_cnter += 1
+        # perf = sum_reward/100
+        # if diagnostics is not None:
+        #     diagnostics.append({
+        #         "episode": ep, "steps": step, "ac_active_fraction": ac_frac,
+        #         "ac_in_band": not ac_out_of_range,
+        #         # "ac_decision_std": float(np.std(ac_decision_fractions)),
+        #         # "ac_decisions_in_band_fraction": float(np.mean([
+        #         #     AC_LO <= v <= AC_HI for v in ac_decision_fractions])),
+        #         "mc_active_fraction": mc_frac_sum / max(1, step),
+        #         "total_reward": float(total_reward), "task_performance": float(perf),
+        #         "ac_penalty": float(ac_penalty), "intercepts": intercepts,
+        #     })
 
-        # when AC activity is out of range, the punishment is the distance from
-        # the ideal firing rate (middle of the band) instead of task performance
-        ac_penalty = 0.0
-        if ac_out_of_range:
-            ac_penalty = args.ac_penalty * abs(ac_frac - 0.5)
-            ac_penalty_sum += ac_penalty
-            out_of_range_cnter += 1
-        perf = sum_reward/100
-
-        # create a sliding history window of past rewards
-        if len(past_performances) < args.trn_eps:
-            past_performances.insert(0,perf)
-        else:
-            past_performances.insert(0,perf)
-            past_performances.pop()
-            avg_perf = sum(past_performances)/len(past_performances)
-            print(f"AVERAGE REWARD PAST 5: {avg_perf}", flush=True)
+        # # create a sliding history window of past rewards
+        # if len(past_performances) < args.trn_eps:
+        #     past_performances.insert(0,perf)
+        # else:
+        #     past_performances.insert(0,perf)
+        #     past_performances.pop()
+        #     avg_perf = sum(past_performances)/len(past_performances)
+        #     print(f"AVERAGE REWARD PAST 5: {avg_perf}", flush=True)
 
         if net.reward_fn is not None:
             net.reward_fn.update(accumulated_reward=total_reward, steps=step)
@@ -369,23 +417,23 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
         # plotting + diagnostics code
         print(f"Episode {ep}: total reward {total_reward:.2f}"
               f"intercepts {intercepts} "
-              f"target visible {visible_steps / max(1, step):.0%} | "
-              f"AC active {ac_frac:.1%}, "
-              f"MC active {mc_frac_sum / max(1, step):.1%} | "
-              f"AC penalty {ac_penalty:.3f}")
-        os.makedirs(OUT_FILE_PATH, exist_ok=True)
-        if capturing and replay_frames:
-            saveReplayGIF(replay_frames,
-                          os.path.join(OUT_FILE_PATH,
-                                       f"{replay_prefix}_ep{ep:05d}.gif"),
-                          fps=replay_fps)
-        if capturing and raster_frames:
-            # Frame count matches the env GIF (both open on the initial state), so
-            # frame i is the same instant in both and they play in lockstep.
-            saveReplayGIF(raster_frames,
-                          os.path.join(OUT_FILE_PATH,
-                                       f"{replay_prefix}_raster_ep{ep:05d}.gif"),
-                          fps=replay_fps)
+              f"target visible {visible_steps / max(1, step):.0%} | ")
+            #   f"AC active {ac_frac:.1%}, "
+            #   f"MC active {mc_frac_sum / max(1, step):.1%} | "
+            #   f"AC penalty {ac_penalty:.3f}")
+        # os.makedirs(OUT_FILE_PATH, exist_ok=True)
+        # if capturing and replay_frames:
+        #     saveReplayGIF(replay_frames,
+        #                   os.path.join(OUT_FILE_PATH,
+        #                                f"{replay_prefix}_ep{ep:05d}.gif"),
+        #                   fps=replay_fps)
+        # if capturing and raster_frames:
+        #     # Frame count matches the env GIF (both open on the initial state), so
+        #     # frame i is the same instant in both and they play in lockstep.
+        #     saveReplayGIF(raster_frames,
+        #                   os.path.join(OUT_FILE_PATH,
+        #                                f"{replay_prefix}_raster_ep{ep:05d}.gif"),
+        #                   fps=replay_fps)
         # if capturing and raster_windows:
         #     plotRasterTimeline(
         #         raster_windows, args.raster_layers, gran, ep,
@@ -393,8 +441,8 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
         #                      f"{replay_prefix}_rastertl_ep{ep:05d}.png"))
         if capturing and raster_fig is not None:
             plt.close(raster_fig)
-        if weight_features is not None and ep % render_every == 0:
-            plotWeightGraphs(weight_features, ep)
+        # if weight_features is not None and args.plot_every and ep % render_every == 0:
+            # plotWeightGraphs(weight_features, ep)
             # plotMotorWeightPolar(feat_ac_mc.value, last_active_ac, ep)
         if args.write and rfname:
             with open(rfname, "ab") as f:
@@ -404,13 +452,38 @@ def runSimulator(net, env, spikes, episodes, W_grid, peak,
                 f.write(("," if ep else "") + str(intercepts))
         if ep % args.fcycle == 0:
             env.cycleOutFiles()
-    # AC was not sufficiently active: fitness is the (negative) average distance
-    # from the ideal firing rate over the out-of-range episodes
-    if out_of_range_cnter:
-        return -ac_penalty_sum / out_of_range_cnter
-    # AC in range: use the average performance of final 5 as the fitness score
-    if not past_performances:
-        return 0.0
+
+    # Average the already-computed window scores, not the counts before scoring.
+    selected_layers = {
+        1: (LAYER_GCA, LAYER_GCT),
+        2: (LAYER_PCA, LAYER_PCT),
+        3: (LAYER_AC,),
+        4: (LAYER_MC,),
+    }.get(reward_type)
+    if selected_layers is not None:
+        if total_windows == 0:
+            raise ValueError("Cannot calculate spike-count fitness without decision windows")
+        fitness = 0.0
+        summaries = []
+        for name in selected_layers:
+            mean_spikes = spike_mean_sums[name] / total_windows
+            active_fraction = active_fraction_sums[name] / total_windows
+            active_mean = active_spike_sums[name] / max(1, active_neuron_windows[name])
+            layer_fitness = layer_fitness_sums[name] / total_windows
+            fitness += layer_fitness
+            summaries.append(
+                f"{name} active={active_fraction:.2%}, "
+                f"active_mean={active_mean:.4f} spikes/active-neuron/window, "
+                f"all_neuron_mean={mean_spikes:.4f} "
+                f"(fitness={layer_fitness:+.4f})"
+            )
+        print(
+            f"[Activity fitness | {replay_prefix}] target_active=50%, "
+            f"target_spikes={target_spikes:g}/active-neuron/window | " + " | ".join(summaries)
+            + f" | Combined fitness={fitness:+.4f} | windows={total_windows}",
+            flush=True,
+        )
+        return float(fitness)
     return sum(past_performances)/len(past_performances)
 
 
@@ -424,15 +497,15 @@ def do_task(param, task_args=None):
                   every architecture knob is read from.
     Returns {'fitnessScore': float, ...}.
     """
-    global OUT_FILE_PATH
+    # global OUT_FILE_PATH
 
-    # Per-candidate output folder: parallel agents must not share one.
-    if task_args is not None and getattr(task_args, "path", None):
-        OUT_FILE_PATH = os.path.join(
-            task_args.path, "dotTracing_out",
-            f"agent{getattr(task_args, 'agent_idx', 0)}"
-            f"_test{getattr(task_args, 'agent_test_num', 0)}") + os.sep
-    os.makedirs(OUT_FILE_PATH, exist_ok=True)
+    # # Per-candidate output folder: parallel agents must not share one.
+    # if task_args is not None and getattr(task_args, "path", None):
+    #     OUT_FILE_PATH = os.path.join(
+    #         task_args.path, "dotTracing_out",
+    #         f"agent{getattr(task_args, 'agent_idx', 0)}"
+    #         f"_test{getattr(task_args, 'agent_test_num', 0)}") + os.sep
+    # os.makedirs(OUT_FILE_PATH, exist_ok=True)
 
     # Seed here, not at import: the module is imported once but run_task is called
     # once per candidate, so import-time seeding never re-seeds between candidates.
@@ -442,11 +515,18 @@ def do_task(param, task_args=None):
     # ---- decode the scalar genes ------------------------------------------ #
     s_gc_pc1   = geneScalar(param, "scaler_gc_pc1")
     s_gc_pc2   = geneScalar(param, "scaler_gc_pc2")
-    s_pc_ac1   = geneScalar(param, "scaler_pc_ac1")
-    s_pc_ac2   = geneScalar(param, "scaler_pc_ac2")
-    s_ac_mc    = geneScalar(param, "scaler_ac_mc")
-    s_inhib_ac = geneScalar(param, "scaler_inhib_ac")
-    s_inhib_mc = geneScalar(param, "scaler_inhib_mc")
+    # Fixed baselines while downstream genes are omitted from the YAML.
+    # Restoring a gene under param makes its candidate value take precedence.
+    s_pc_ac1   = geneScalar(param, "scaler_pc_ac1", default=1.0)
+    s_pc_ac2   = geneScalar(param, "scaler_pc_ac2", default=1.0)
+    s_ac_mc    = geneScalar(param, "scaler_ac_mc", default=1.0)
+    s_inhib_ac = geneScalar(param, "scaler_inhib_ac", default=1.0)
+    s_inhib_mc = geneScalar(param, "scaler_inhib_mc", default=1.0)
+
+    pc_tc_trace = geneScalar(param, "tc_trace", default=20.0)
+    pc_tc_decay = geneScalar(param, "tc_decay", default=20.0)
+
+
     print(f"[gene] gc_pc={s_gc_pc1:.3f}/{s_gc_pc2:.3f}  "
           f"pc_ac={s_pc_ac1:.3f}/{s_pc_ac2:.3f}  ac_mc={s_ac_mc:.3f}  "
           f"inhib_ac={s_inhib_ac:.3f}  inhib_mc={s_inhib_mc:.3f}", flush=True)
@@ -475,7 +555,7 @@ def do_task(param, task_args=None):
                       dtype=np.float32)
         lattice_base = ij[:, :1] * b1 + ij[:, 1:] * b2
 
-        for r_i in range(7): # 7 rotations
+        for r_i in range(6): # 6 rotations
             theta = np.pi * r_i / 7
             cos_t, sin_t = np.cos(theta), np.sin(theta)
             R = np.array([[cos_t, -sin_t], [sin_t, cos_t]], dtype=np.float32)
@@ -511,26 +591,28 @@ def do_task(param, task_args=None):
     gc_a = Input(n=n_gc, shape=[1, 1, 1, 1, n_gc], traces=True)
     gc_t = Input(n=n_gc, shape=[1, 1, 1, 1, n_gc], traces=True)
 
+    print(f"USED TC_DECAY: {pc_tc_decay:.3f} USED TC_TRACE: {pc_tc_trace:.3f}",flush=True)
+
     # agent place cells
     pc_a = LIFNodes(n=args.n_pc, traces=True,
-                    rest=-64.0, reset=-70.0, thresh=-25.0,
-                    refrac=1, tc_decay=20.0, tc_trace=20.0,
+                    rest=-64.0, reset=-70.0, thresh=-61.0,
+                    refrac=1, tc_decay=pc_tc_decay, tc_trace=pc_tc_trace,
                     lbound=args.pc_lbound)
     # target place cells
     pc_t = LIFNodes(n=args.n_pc, traces=True,
-                    rest=-64.0, reset=-70.0, thresh=-25.0,
-                    refrac=1, tc_decay=20.0, tc_trace=20.0,
+                    rest=-64.0, reset=-70.0, thresh=-61.0,
+                    refrac=1, tc_decay=pc_tc_decay, tc_trace=pc_tc_trace,
                     lbound=args.pc_lbound)
 
     ac = LIFNodes(n=args.ac, traces=True,
-                  rest=-64.0, reset=-70.0, thresh=-50.0,
+                  rest=-64.0, reset=-70.0, thresh=-62.0,
                   refrac=1, tc_decay=20.0, tc_trace=20.0,
                   lbound=args.ac_lbound)
 
     # neurons 0-99: pause, 100-199: up, 200-299: right, 300-399: down, 400-499: left
     n_mc = moveChoices * args.mc_pop
     mc = LIFNodes(n=n_mc, traces=True,
-                  rest=-64.0, reset=-64.0, thresh=-55.0,
+                  rest=-64.0, reset=-64.0, thresh=-62.0,
                   refrac=0, tc_decay=20.0, tc_trace=20.0,
                   lbound=args.mc_lbound)
 
@@ -541,37 +623,20 @@ def do_task(param, task_args=None):
     net.add_layer(ac,   name=LAYER_AC)
     net.add_layer(mc,   name=LAYER_MC)
 
-    # ---- decode the sparsity genes ---------------------------------------- #
-    # Each pathway evolves its connection PROBABILITY, not its weight matrix. The
-    # mask is `fixed_uniform_draw < sparsity`, so raising a gene only ADDS synapses
-    # (the ones already present stay), which keeps the fitness landscape smooth for
-    # ES. The weight values themselves are fixed draws from args.seed.
-    p_gc_pc_a = geneScalar(param, "sparsity_gc_pc_a")
-    p_gc_pc_t = geneScalar(param, "sparsity_gc_pc_t")
-    p_pc_ac_a = geneScalar(param, "sparsity_pc_ac_a")
-    p_pc_ac_t = geneScalar(param, "sparsity_pc_ac_t")
-    p_rec     = geneScalar(param, "sparsity_rec")
-    p_ac_mc   = geneScalar(param, "sparsity_ac_mc")
-    p_mc_opp  = geneArray(param, "sparsity_mc_opp", 2 * len(OPPONENT_PAIRS))
-    print(f"[gene] sparsity gc_pc={p_gc_pc_a:.3f}/{p_gc_pc_t:.3f}  "
-          f"pc_ac={p_pc_ac_a:.3f}/{p_pc_ac_t:.3f}  rec={p_rec:.3f}  "
-          f"ac_mc={p_ac_mc:.3f}  mc_opp={[round(float(v), 3) for v in p_mc_opp]}",
-          flush=True)
-
     # weight values: separate generator so the mask streams are unaffected
-    w_gen = torch.Generator(device="cpu").manual_seed(args.seed + 20)
+    w_gen = torch.Generator(device="cpu").manual_seed(29)
 
     # grid cell to place cell connections
-    gen_a = torch.Generator(device="cpu").manual_seed(args.seed + 10)
+    gen_a = torch.Generator(device="cpu").manual_seed(20)
     gc_pc_mask_a = (torch.rand(n_gc, args.n_pc, generator=gen_a)
-                    < p_gc_pc_a).float().to(DEVICE)
+                    < 0.4).float().to(DEVICE)
     W_gc_pc_a = gc_pc_mask_a * torch.rand(n_gc, args.n_pc, generator=w_gen).to(DEVICE)
     W_gc_pc_a = (W_gc_pc_a / gc_pc_mask_a.sum(0).mean().clamp(min=1.0).sqrt()
                  ) * s_gc_pc1
 
-    gen_t = torch.Generator(device="cpu").manual_seed(args.seed + 11)
+    gen_t = torch.Generator(device="cpu").manual_seed(23)
     gc_pc_mask_t = (torch.rand(n_gc, args.n_pc, generator=gen_t)
-                    < p_gc_pc_t).float().to(DEVICE)
+                    < 0.4).float().to(DEVICE)
     W_gc_pc_t = gc_pc_mask_t * torch.rand(n_gc, args.n_pc, generator=w_gen).to(DEVICE)
     W_gc_pc_t = (W_gc_pc_t / gc_pc_mask_t.sum(0).mean().clamp(min=1.0).sqrt()
                  ) * s_gc_pc2
@@ -591,12 +656,12 @@ def do_task(param, task_args=None):
     # PLACE to ASSOCIATION connection
     dense_fan = float(2 * args.n_pc)
     pc_ac_a_mask = (torch.rand(args.n_pc, args.ac, generator=gen_a)
-                    < p_pc_ac_a).float().to(DEVICE)
+                    < 0.6).float().to(DEVICE)
     W_pc_ac_a = (pc_ac_a_mask
                  * torch.rand(args.n_pc, args.ac, generator=w_gen).to(DEVICE)
                  / np.sqrt(dense_fan)) * s_pc_ac1
     pc_ac_t_mask = (torch.rand(args.n_pc, args.ac, generator=gen_t)
-                    < p_pc_ac_t).float().to(DEVICE)
+                    < 0.6).float().to(DEVICE)
     W_pc_ac_t = (pc_ac_t_mask
                  * torch.rand(args.n_pc, args.ac, generator=w_gen).to(DEVICE)
                  / np.sqrt(dense_fan)) * s_pc_ac2
@@ -613,18 +678,8 @@ def do_task(param, task_args=None):
                                    pipeline=[feat_pc_ac_t], device=DEVICE),
         source=LAYER_PCT, target=LAYER_AC)
 
-    # Recurrent association layer connection reservoir, no learning done.
-    # Signed randn() weights so the layer gets both excitatory and inhibitory
-    # recurrence; sparsity_rec picks how many of them exist.
-    rec_gen = torch.Generator(device="cpu").manual_seed(args.seed + 12)
-    rec_mask = (torch.rand(args.ac, args.ac, generator=rec_gen)
-                < p_rec).float().to(DEVICE)
-    W_rec = rec_mask * torch.randn(args.ac, args.ac, generator=w_gen).to(DEVICE)
-    # normalize each by sum of their columns and mult by scale factor
-    # W_rec = W_rec / W_rec.abs().sum(0, keepdim=True).clamp(min=1e-6) 
-    # YAML allows scaler_inhib_ac down to 0.0, and this is a DIVISOR, so clamp:
-    # at 0 the recurrent weights blow up to inf and the whole episode goes NaN.
-    W_rec = W_rec / max(s_inhib_ac, 1e-3)
+    W_rec = torch.randn(args.ac, args.ac, generator=w_gen).to(DEVICE)
+    W_rec = W_rec * s_inhib_ac
     W_rec.fill_diagonal_(0.0)
     feat_rec = Weight(name="w_rec", value=W_rec)
     net.add_connection(
@@ -635,7 +690,7 @@ def do_task(param, task_args=None):
     # association to motor layer, the only learning layer
     ac_mc_gen = torch.Generator(device="cpu").manual_seed(args.seed + 4)
     ac_mc_mask_gen = (torch.rand(args.ac, n_mc, generator=ac_mc_gen)
-                      < p_ac_mc).to(DEVICE)
+                      < 0.7).to(DEVICE)
 
     ac_mc_mask = Mask(name='ac_mc_mask', value=ac_mc_mask_gen)
 
@@ -657,12 +712,12 @@ def do_task(param, task_args=None):
     # sparsity_mc_opp holds one connection probability per directed opponent
     # block, in the order (a->b, b->a) for each entry of OPPONENT_PAIRS, so the
     # two directions of a pair can evolve asymmetrically.
-    opp_gen = torch.Generator(device="cpu").manual_seed(args.seed + 13)
+    opp_gen = torch.Generator(device="cpu").manual_seed(13)
     for i, (a, b) in enumerate(OPPONENT_PAIRS): # two pairs - up down and right left
         sa = slice(a * args.mc_pop, (a + 1) * args.mc_pop)
         sb = slice(b * args.mc_pop, (b + 1) * args.mc_pop)
-        m_ab = torch.rand(args.mc_pop, args.mc_pop, generator=opp_gen) < float(p_mc_opp[2 * i])
-        m_ba = torch.rand(args.mc_pop, args.mc_pop, generator=opp_gen) < float(p_mc_opp[2 * i + 1])
+        m_ab = torch.rand(args.mc_pop, args.mc_pop, generator=opp_gen)
+        m_ba = torch.rand(args.mc_pop, args.mc_pop, generator=opp_gen)
         W_mc_opp[sa, sb] = m_ab.float().to(DEVICE) * s_inhib_mc  # a inhibits b
         W_mc_opp[sb, sa] = m_ba.float().to(DEVICE) * s_inhib_mc  # b inhibits a
 
@@ -679,27 +734,24 @@ def do_task(param, task_args=None):
     if feat_mc_opp is not None:
         weight_features["mc_opp"] = feat_mc_opp
 
-    print(f"[arch] GC {n_gc} x2  ->  PC {args.n_pc} x2 (sparse "
-          f"{p_gc_pc_a:.0%}/{p_gc_pc_t:.0%})  ->  AC {args.ac} "
-          f"(rec {p_rec:.0%})  ->  MC {n_mc}")
-    print(f"[gate] view_r={args.view_r} on a {dim}x{dim} board: target is visible "
-          f"when Chebyshev distance <= {args.view_r}")
-
     spikes = {}
     for layer in net.layers:
         spikes[layer] = Monitor(net.layers[layer], state_vars=["s"],
                                 time=int(args.granularity / args.dt), device=DEVICE)
         net.add_monitor(spikes[layer], name=layer)
  
+    env_options = {} if args.env_seed is None else {"seed": args.env_seed}
     environment = DotSimulator(
         args.steps, decay=args.decay, herrs=args.herrs, diag=args.diag,
         randr=args.randr, write=args.write, mute=args.mute,
         bound_hand=args.boundh, fit_func=args.fit_func, 
         allow_stay=args.allow_stay, pandas=args.pandas, fpath=OUT_FILE_PATH,
+        **env_options,
     )
     environment.reset()
 
     print("Training:")
+    train_diagnostics, test_diagnostics = [], []
     environment.addFileSuffix("train")
     train_fitness = runSimulator(
         net, environment, spikes, args.trn_eps, W_grid, peak,
@@ -708,7 +760,9 @@ def do_task(param, task_args=None):
         weight_features=weight_features, render_replays=args.render_replays,
         render_every=args.render_every, replay_fps=args.replay_fps,
         replay_prefix="replay_train", view_r=args.view_r, dim=dim,
+        diagnostics=train_diagnostics, reward_type=2
     )
+    
     net.learning = False
     print("Testing:")
     environment.changeFileSuffix("train", "test")
@@ -719,13 +773,20 @@ def do_task(param, task_args=None):
         weight_features=weight_features, render_replays=args.render_replays,
         render_every=args.render_every, replay_fps=args.replay_fps,
         replay_prefix="replay_test", view_r=args.view_r, dim=dim,
+        diagnostics=test_diagnostics, reward_type=2
     )
+
+    print(f"RETURNED FITNESS: {fitness}", flush=True)
 
     # task_dotTracing.main() indexes outP['fitnessScore'], so return a dict.
     return {
         "fitnessScore": float(fitness),
         "train_fitness": float(train_fitness),
-        "out_path": OUT_FILE_PATH,
+        "train_episodes": train_diagnostics,
+        "test_episodes": test_diagnostics,
+        "ac_active_fraction": float(np.mean([e["ac_active_fraction"] for e in test_diagnostics])) if test_diagnostics else None,
+        "ac_all_episodes_in_band": all(e["ac_in_band"] for e in test_diagnostics) if test_diagnostics else None,
+        # "out_path": OUT_FILE_PATH,
     }
 
 

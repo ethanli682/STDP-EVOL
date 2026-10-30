@@ -108,7 +108,7 @@ def _compute_weights(eff_lambda, mu, scaler_type, elite_weights_ext, device):
 
 def _update_group_cma(gs, elite_slice, weights, weights_pos, weights_neg, mueff,
                       sigma_cfg_new, device, condition_threshold, sigma_min_restart,
-                      restart_on_condition, sigma_max_restart=5.0):
+                      restart_on_condition, sigma_max_restart=5.0, initial_sigma=0.5):
     """
     Run one CMA-ES update step on a single group.
     elite_slice: (eff_lambda, n_g) tensor of elite genes for this group.
@@ -452,7 +452,12 @@ def createCandidateGene_CMA_ES(
             print(f"[CMA-ES ERROR] Processing genePopulation failed: {e}", flush=True)
 
     # --- PATH B: Disk Streaming (OOM Safe) ---
-    elif genePopulation is None:
+    # PATH B also catches a FAILED path A. This was `elif genePopulation is None`,
+    # so an in-memory population that raised (e.g. records with no 'gene' key) or
+    # was too small left data_available False with no second attempt: the state was
+    # never updated and the algorithm silently sampled from a frozen distribution.
+    # Streaming from disk is the same source path A wanted, only bounded and safe.
+    if not data_available:
         try:
             loader = ChunkedGeneHistoryLoader(
                 savePath=EA_Class.savePath, agent_id=args.agent_idx, geneFormat=getattr(EA_Class, 'geneFormat', 'json'), shuffle=True
@@ -585,10 +590,19 @@ def createCandidateGene_CMA_ES(
             elite_slice = elite_genes[:, g_start:g_end]
 
             try:
+                # initial_sigma MUST be passed: both restart branches call
+                # _init_group_state(initial_sigma=initial_sigma). It used to be read
+                # from an enclosing scope that does not exist, so EVERY restart raised
+                # NameError, the except below swallowed it, and the group's state --
+                # including its iteration counter -- was left untouched. Since the
+                # restart trigger (condition number) is a property of that frozen
+                # state, the group then tripped the same restart every generation and
+                # never updated again. That is the W3 iter=155 vs W1 iter=615 split.
                 updated_gs, did_restart, info = _update_group_cma(
                     gs, elite_slice, weights, weights_pos, weights_neg, mueff,
                     None, device, condition_threshold, sigma_min_restart,
-                    restart_on_condition, sigma_max_restart)
+                    restart_on_condition, sigma_max_restart,
+                    initial_sigma=initial_sigma)
 
                 cma_state['groups'][gname] = updated_gs
                 log_sigmas[gname] = info.get('sigma', 0.0)
@@ -753,7 +767,20 @@ def createCandidateGene_CMA_ES(
     # ── Random injection ──────────────────────────────────────────────────
     # Replace a fraction of candidates with pure random genes to maintain
     # exploration and prevent premature convergence (same as SNES).
-    num_random = max(1, int(len(candidates) * random_injection_rate))
+    # Stochastic rounding of the injection count. The old `max(1, int(n*rate))`
+    # forced at least one random gene, so a 1-candidate call (the default,
+    # --total_testsGene_with_same_agent=1) replaced its ONLY candidate every
+    # time -- 100% random search wearing the CMA-ES logs. Rounding the
+    # fractional part probabilistically makes the long-run rate equal `rate`
+    # (a 1-candidate call is random `rate` of the time), and the cap keeps at
+    # least one algorithm sample alive whenever more than one was asked for.
+    _n_cand = len(candidates)
+    _expected_random = _n_cand * random_injection_rate
+    num_random = int(_expected_random)
+    if np.random.random() < (_expected_random - num_random):
+        num_random += 1
+    if _n_cand > 1:
+        num_random = min(num_random, _n_cand - 1)
     for i in range(num_random):
         idx = len(candidates) - 1 - i  # replace from the end (worst mirrored)
         if idx >= 0:

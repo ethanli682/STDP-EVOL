@@ -1,5 +1,12 @@
+# if neuron is active: if a neuron alwasy fires or never, its useless
+# need to fire at least a few times
+# evolve weight scalar is similar to threashold
+# 
+
+
 import os, sys, json, subprocess, signal, argparse, pickle, zstandard
 import traceback
+from pprint import pformat
 from datetime import datetime
 from slurmHPCHelper import *
 from GA_utils_misc_func import pickle_loads_compat
@@ -71,14 +78,29 @@ def main(args):
         format = 'pkl'
 
     for gene_num in range(len(params_config)):
+        candidate_label = (
+            f"Agent {args.agent_idx} | candidate {gene_num + 1}/{len(params_config)}"
+        )
+        print(f"\n[{candidate_label}] Parameters:\n"
+              f"{pformat(params_config[gene_num].get('param', {}), sort_dicts=False)}",
+              flush=True)
         fitness = []
         for test in range(args.total_test_with_same_param):
             #-----------------------
             outP = run_task(params_config[gene_num], args)
             #-----------------------
+            score = outP.get('fitnessScore') if outP is not None else None
+            print(f"[{candidate_label}] Test {test + 1}/{args.total_test_with_same_param} "
+                  f"fitness: {score if score is not None else 'FAILED (no fitness)'}",
+                  flush=True)
+            if outP is None:
+                outP = {"fitnessScore": None, "error": "Task returned no result"}
             if outP['fitnessScore'] is not None:
                 fitness.append(outP['fitnessScore'])    
 
+        print(f"[{candidate_label}] Fitness scores: {fitness} | "
+              f"Mean fitness: {float(np.mean(fitness)) if fitness else 'N/A'}",
+              flush=True)
         if len(fitness) > 0:
             outP['fitnessScore'] = fitness
 
@@ -196,7 +218,6 @@ def run(args, self=False, params=None):
             excludeNodes=params['main']['Task_resource']['exclude_nodes'] if self else params['main']['Main_resource']['exclude_nodes'],
             condaEnv=params['main']['Task_resource']['conda_env'] if self else params['main']['Main_resource']['conda_env'],
             partition=params['main']['Task_resource']['partition'] if self else params['main']['Main_resource']['partition'],
-                singularity_image=params['main']['Task_resource'].get('singularity_image', '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif') if self else params['main']['Main_resource'].get('singularity_image', '/cluster/tufts/levinlab/hhazan01/singularity/delayW.sif'),
             command="python " + str(run_process).replace('[','').replace(']','').replace('\', \'',' ').replace('\'',''),
             nextTask=temp_file,
         )

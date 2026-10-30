@@ -1,4 +1,5 @@
 import os
+import shlex
 
 # to be ran on tufts hpc cluster with only conda env
 # This function retuen a text with the slurm script
@@ -15,7 +16,7 @@ def SlurmScript(jobName,
                 nextTask = '',
                 extra_pythonpath = '',
                 run_mode = 'conda',
-                conda_sh = 'source /cluster/home/eli08/miniconda3/etc/profile.d/conda.sh',
+                conda_sh = '/cluster/home/eli08/miniconda3/etc/profile.d/conda.sh',
                 ):
 
       run_mode = (str(run_mode).strip().lower() or 'singularity')
@@ -153,8 +154,12 @@ def SlurmScript(jobName,
       # environment (no --env passthrough needed). PYTHONPATH + thread caps
       # are set exactly as the singularity path set them, for parity.
       returnText += 'echo "------Conda Exec-----"\n'
-      returnText += f'source {conda_sh}\n'
-      returnText += f'conda activate {condaEnv}\n'
+      # Accept the old default's leading "source" as well as a plain path.
+      conda_init_path = conda_sh.removeprefix('source ').strip()
+      returnText += (f'source {shlex.quote(conda_init_path)} || '
+                     '{ echo "ERROR: Could not initialize conda" >&2; exit 1; }\n')
+      returnText += (f'conda activate {shlex.quote(condaEnv)} || '
+                     '{ echo "ERROR: Could not activate conda environment; check conda info --envs" >&2; exit 1; }\n')
       returnText += f'export PYTHONPATH={pythonpath_val}\n'
       returnText += 'export OMP_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}\n'
       returnText += 'export OPENBLAS_NUM_THREADS=${SLURM_CPUS_PER_TASK:-1}\n'
